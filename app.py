@@ -23,6 +23,7 @@ DATA_DIR = APP_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
 ASSET_DIR = APP_DIR / "assets"
 DB_PATH = DATA_DIR / "signal_radar.db"
+WHITELIST_PATH = APP_DIR / "asset_whitelist.txt"
 SEED_CSV = DATA_DIR / "seed_signals.csv"
 SEED_UPDATES_CSV = DATA_DIR / "seed_updates.csv"
 
@@ -40,7 +41,7 @@ BIAS_OPTIONS = ["LONG", "SHORT", "NEUTRAL"]
 BIAS_ICON = {"LONG": "▲", "SHORT": "▼", "NEUTRAL": "•"}
 CATEGORIES = ["ANALISI", "MACRO", "WATCH", "SETUP", "ENTRY", "UPDATE", "RESULT", "RULE", "INFO"]
 
-st.set_page_config(page_title="Signal Radar V2", page_icon="📡", layout="wide")
+st.set_page_config(page_title="Signal Radar V2.1", page_icon="📡", layout="wide")
 
 
 def get_conn():
@@ -128,7 +129,34 @@ def init_db():
                     (signal_id, r["received_at"], r["category"], r["summary"], r["image_path"], r["raw_text"], "", Path(r["image_path"]).name),
                 )
             conn.commit()
+
+    # V2.1 migration: seed rows from older versions had no hash, so uploading the
+    # same screenshots created duplicate setups. Backfill hashes from any local image.
+    for r in conn.execute("SELECT id,image_path,file_hash FROM updates WHERE COALESCE(file_hash,'')='' ").fetchall():
+        rel = str(r["image_path"] or "")
+        img_path = APP_DIR / rel if rel else None
+        if img_path and img_path.exists() and img_path.is_file():
+            try:
+                h = hashlib.sha256(img_path.read_bytes()).hexdigest()
+                conn.execute("UPDATE updates SET file_hash=? WHERE id=?", (h, int(r["id"])))
+            except Exception:
+                pass
+    conn.commit()
     conn.close()
+
+
+def reset_to_seed():
+    """Delete test/imported DB rows and restore the curated baseline CSVs."""
+    conn = get_conn()
+    conn.execute("DELETE FROM updates")
+    conn.execute("DELETE FROM signals")
+    try:
+        conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('signals','updates')")
+    except Exception:
+        pass
+    conn.commit()
+    conn.close()
+    init_db()
 
 
 def auto_expire():
@@ -279,63 +307,119 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip().lower()
 
 
-def ocr_image(data: bytes) -> str:
+def _prep_ocr(img: Image.Image, scale: float = 1.8) -> Image.Image:
+    from PIL import ImageEnhance, ImageOps
+    if scale != 1:
+        img = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))))
+    img = ImageOps.grayscale(img)
+    img = ImageEnhance.Contrast(img).enhance(1.7)
+    return img
+
+
+def ocr_image_regions(data: bytes) -> dict[str, str]:
+    """Two-pass OCR: header for titles/tickers + full image for context.
+
+    This is intentionally conservative: OCR is used to organize screenshots,
+    never to accept numeric trading levels automatically.
+    """
     if pytesseract is None or shutil.which("tesseract") is None:
-        return ""
+        return {"header": "", "full": "", "combined": ""}
     try:
         img = Image.open(io.BytesIO(data)).convert("RGB")
-        max_w = 1800
-        if img.width > max_w:
-            ratio = max_w / img.width
-            img = img.resize((max_w, int(img.height * ratio)))
-        return pytesseract.image_to_string(img, config="--psm 6")
+        # Header carries ticker/title/bias much more reliably than the full screenshot.
+        header = img.crop((0, 0, img.width, max(1, int(img.height * 0.42))))
+        header_txt = pytesseract.image_to_string(_prep_ocr(header, 1.8), config="--psm 11")
+        # Full pass keeps annotations/messages. Limit width for Streamlit Cloud speed.
+        if img.width > 1800:
+            ratio = 1800 / img.width
+            img = img.resize((1800, int(img.height * ratio)))
+        full_txt = pytesseract.image_to_string(_prep_ocr(img, 1.25), config="--psm 6")
+        combined = (header_txt + "\n" + full_txt).strip()
+        return {"header": header_txt, "full": full_txt, "combined": combined}
     except Exception:
-        return ""
+        return {"header": "", "full": "", "combined": ""}
 
 
-MONTHS = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"]
+def load_asset_whitelist() -> list[dict]:
+    out = []
+    if WHITELIST_PATH.exists():
+        for raw in WHITELIST_PATH.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [x.strip() for x in line.split("|", 2)]
+            if len(parts) != 3:
+                continue
+            code, name, aliases = parts
+            out.append({"code": code.upper(), "name": name, "aliases": [a.strip().lower() for a in aliases.split(";") if a.strip()]})
+    return out
 
 
-def detect_instrument(text: str) -> tuple[str, str]:
-    t = normalize_text(text)
-    rules = [
-        (r"\b6n1?\b|new zealand dollar", "6N", "New Zealand Dollar Futures"),
-        (r"\b6j1?\b|japanese yen", "6J", "Japanese Yen Futures"),
-        (r"\bfdax1?\b|\bdax\b|pax strategia", "DAX", "DAX Futures"),
-        (r"\bfesx1?\b|euro ?stoxx|eurostoxx|burostoxx", "FESX", "Euro Stoxx 50 Futures"),
-        (r"\bes1?\b|s&p ?500|s&p500|sp ?500|e-mini s&p", "ES", "S&P 500 E-mini Futures"),
-        (r"\bnq1?\b|nasdaq", "NQ", "Nasdaq 100 Futures"),
-        (r"\brty1?\b|russell", "RTY", "Russell 2000 Futures"),
-        (r"\bym1?\b|dow jones", "YM", "Dow Jones Futures"),
-        (r"\bgc1?\b|gold futures|oro", "GC", "Gold Futures"),
-        (r"\bcl1?\b|wti|crude oil", "CL", "WTI Crude Oil Futures"),
-        (r"\bhg1?\b|copper|rame", "HG", "Copper Futures"),
-        (r"\b6e1?\b|euro fx", "6E", "Euro FX Futures"),
-        (r"\b6b1?\b|british pound", "6B", "British Pound Futures"),
-    ]
-    for pattern, code, name in rules:
-        if re.search(pattern, t, flags=re.I):
-            return code, name
-    return "", ""
+ASSET_RULES = load_asset_whitelist()
 
 
-def detect_bias(text: str) -> str:
-    t = normalize_text(text)
-    short_terms = ["entry short", "strategia short", "target mensile short", "emo short", "short w", "scenario short"]
-    long_terms = ["entry long", "strategia long", "target mensile long", "emo long", "scenario long"]
-    s = sum(t.count(x) for x in short_terms)
-    l = sum(t.count(x) for x in long_terms)
-    if s > l and s > 0:
-        return "SHORT"
-    if l > s and l > 0:
-        return "LONG"
-    return "NEUTRAL"
+def _alias_found(alias: str, text: str) -> bool:
+    if not alias:
+        return False
+    a = re.escape(alias.lower())
+    # Symbol-like aliases must appear as their own token. This avoids CL/HG false positives
+    # from random OCR syllables.
+    if re.fullmatch(r"[a-z0-9!&. -]+", alias.lower()) and len(alias.replace("!", "").replace(" ", "")) <= 5:
+        return re.search(rf"(?<![a-z0-9]){a}(?![a-z0-9])", text, flags=re.I) is not None
+    return alias.lower() in text
+
+
+def detect_instrument(header_text: str, full_text: str) -> tuple[str, str, int]:
+    h = normalize_text(header_text)
+    f = normalize_text(full_text)
+    best = ("", "", 0)
+    for rule in ASSET_RULES:
+        score = 0
+        for alias in rule["aliases"]:
+            if _alias_found(alias, h):
+                score = max(score, 100 if len(alias) >= 6 else 90)
+            elif _alias_found(alias, f):
+                score = max(score, 85 if len(alias) >= 6 else 75)
+        if score > best[2]:
+            best = (rule["code"], rule["name"], score)
+    # Conservative threshold: unknown is better than a false asset.
+    return best if best[2] >= 75 else ("", "", best[2])
+
+
+def _count_terms(text: str, weighted_terms: list[tuple[str, int]]) -> int:
+    return sum(text.count(term) * weight for term, weight in weighted_terms)
+
+
+def detect_bias(header_text: str, full_text: str) -> tuple[str, int]:
+    h = normalize_text(header_text)
+    f = normalize_text(full_text)
+    # Strong operational language carries the decision. Side labels such as "Emo Long"
+    # are deliberately ignored because both long and short levels can coexist on one chart.
+    short_strong = [("entry short", 8), ("strategia short", 8), ("setup short", 7), ("scenario short", 6), ("short w3", 5), ("short w2", 5), ("short w4", 5)]
+    long_strong = [("entry long", 8), ("strategia long", 8), ("setup long", 7), ("scenario long", 6), ("long w3", 5), ("long w2", 5), ("long w4", 5)]
+    short_weak = [("target mensile short", 1), ("target short", 1)]
+    long_weak = [("target mensile long", 1), ("target long", 1)]
+    s = _count_terms(h, short_strong) * 2 + _count_terms(f, short_strong) + _count_terms(f, short_weak)
+    l = _count_terms(h, long_strong) * 2 + _count_terms(f, long_strong) + _count_terms(f, long_weak)
+    if s >= 6 and s >= l + 3:
+        return "SHORT", min(100, 60 + s * 2)
+    if l >= 6 and l >= s + 3:
+        return "LONG", min(100, 60 + l * 2)
+    return "NEUTRAL", max(s, l)
 
 
 def detect_period(text: str, fallback_dt: datetime) -> str:
     t = normalize_text(text)
-    year_match = re.search(r"\b(20\d{2})\b", t)
-    year = year_match.group(1) if year_match else str(fallback_dt.year)
+    # WhatsApp receive year is authoritative unless OCR clearly contains the same year.
+    # This prevents errors such as 2008 instead of 2026 from chart text/noise.
+    years = [int(x) for x in re.findall(r"\b(20\d{2})\b", t)]
+    year = fallback_dt.year
+    if fallback_dt.year in years:
+        year = fallback_dt.year
+    else:
+        plausible = [y for y in years if abs(y - fallback_dt.year) <= 1]
+        if plausible:
+            year = min(plausible, key=lambda y: abs(y - fallback_dt.year))
     month = ""
     for m in MONTHS:
         if m in t:
@@ -354,15 +438,14 @@ def detect_period(text: str, fallback_dt: datetime) -> str:
 def detect_timeframe(text: str) -> str:
     t = normalize_text(text)
     vals = []
-    if re.search(r"\b30\s*['’]?\b|\b30m\b|30 min", t):
+    if re.search(r"\b30\s*['’°]?\b|\b30m\b|30 min", t):
         vals.append("30m")
     if "daily" in t or re.search(r"\b1d\b", t):
         vals.append("D")
     if "weekly" in t or "settimanale" in t or re.search(r"\b1w\b", t):
         vals.append("W")
-    if "mensile" in t or "monthly" in t or re.search(r"\b1m\b", t):
+    if "mensile" in t or "monthly" in t:
         vals.append("M")
-    # keep useful multi-TF context but avoid duplicates
     out = []
     for x in vals:
         if x not in out:
@@ -372,35 +455,30 @@ def detect_timeframe(text: str) -> str:
 
 def detect_category(text: str, instrument: str) -> str:
     t = normalize_text(text)
-    if any(x in t for x in ["risultato come da ipotesi", "risultato", "target raggiunto"]):
+    # General teaching/chat messages must never become active signals even if OCR sees a ticker-like fragment.
+    if any(x in t for x in ["didatticamente", "lezioni", "complimenti", "moltissime opportunita", "attaccare i grafici alla parete", "lanciare una freccetta"]):
+        return "INFO"
+    if any(x in t for x in ["risultato come da ipotesi", "target raggiunto"]):
         return "RESULT"
     if any(x in t for x in ["concetto di frattalita", "attesa della rottura", "puo optare", "regola alternativa"]):
         return "RULE"
     if any(x in t for x in ["livelli di entry", "entry short", "entry long", "potenziali livelli di entry"]):
         return "ENTRY"
-    if "area da attenzionare" in t or "zona da attenzionare" in t:
+    if "area da attenzionare" in t or "zona da attenzionare" in t or ("attenzion" in t and ("area" in t or "zona" in t)):
+        return "WATCH"
+    # Some screenshots render the title poorly; "Area ... W3 Agosto" is still a watch-type
+    # message, but without a recognized asset it remains blocked for manual confirmation.
+    if "area" in t and re.search(r"\bw\s*[1-5]\b", t):
         return "WATCH"
     if "strategia" in t:
         return "SETUP"
-    if any(x in t for x in ["dinamica mensile", "dinamica delle medie", "pavimento importante", "verifica macro"]):
-        return "MACRO"
-    if not instrument and any(x in t for x in ["didattic", "lezioni", "complimenti", "moltissime opportunita"]):
-        return "INFO"
+    if any(x in t for x in ["dinamica mensile", "dinamica delle medie", "pavimento importante", "verifica macro", "settimanale"]):
+        return "MACRO" if instrument else "ANALISI"
     return "ANALISI" if instrument else "INFO"
 
 
 def propose_status(category: str) -> str:
-    return {
-        "RESULT": "CLOSED",
-        "ENTRY": "READY",
-        "SETUP": "READY",
-        "WATCH": "WATCH",
-        "RULE": "WATCH",
-        "MACRO": "WATCH",
-        "ANALISI": "WATCH",
-        "UPDATE": "WATCH",
-        "INFO": "INFO",
-    }.get(category, "WATCH")
+    return {"RESULT": "CLOSED", "ENTRY": "READY", "SETUP": "READY", "WATCH": "WATCH", "RULE": "WATCH", "MACRO": "WATCH", "ANALISI": "WATCH", "UPDATE": "WATCH", "INFO": "INFO"}.get(category, "WATCH")
 
 
 def propose_next_action(category: str, bias: str) -> str:
@@ -431,18 +509,15 @@ def make_summary(instrument: str, category: str, bias: str, period: str, text: s
         pieces.append(period)
     base = " · ".join(pieces)
     t = re.sub(r"\s+", " ", text or "").strip()
-    if t:
-        snippet = t[:220]
-        return f"{base}. OCR: {snippet}"
-    return base
+    return f"{base}. OCR: {t[:220]}" if t else base
 
 
-def confidence_score(instrument: str, bias: str, period: str, timeframe: str, category: str, ocr_text: str) -> int:
-    score = 35
+def confidence_score(instrument: str, asset_conf: int, bias: str, bias_conf: int, period: str, timeframe: str, category: str, ocr_text: str) -> int:
+    score = 20
     if instrument:
-        score += 25
+        score += min(35, int(asset_conf * 0.35))
     if bias != "NEUTRAL":
-        score += 15
+        score += min(20, int(bias_conf * 0.2))
     if period:
         score += 10
     if timeframe:
@@ -451,58 +526,81 @@ def confidence_score(instrument: str, bias: str, period: str, timeframe: str, ca
         score += 5
     if len((ocr_text or "").strip()) > 80:
         score += 5
+    if not instrument and category != "INFO":
+        score = min(score, 45)
     return min(score, 95)
 
 
 def group_key(instrument: str, bias: str, period: str, category: str, received: datetime) -> str:
-    if not instrument:
+    if category == "INFO" or not instrument:
         return "INFO"
     p = period or received.strftime("%Y-%m")
     b = bias if bias != "NEUTRAL" else "DA_VERIFICARE"
     return f"{instrument}|{b}|{p}"
 
 
+def _period_tokens(value: str) -> set[str]:
+    t = normalize_text(value)
+    return set(re.findall(r"w[1-5]|20\d{2}|" + "|".join(MONTHS), t))
+
+
 def recommend_destination(proposal: dict, signals_df: pd.DataFrame) -> str:
     if proposal["Categoria"] == "INFO" or not proposal["Asset"]:
-        return "INFO"
+        return "INFO" if proposal["Categoria"] == "INFO" else "NUOVO"
     if signals_df.empty:
         return "NUOVO"
-    best_label = "NUOVO"
-    best_score = 0
+    best_label, best_score = "NUOVO", -999
+    p_tokens = _period_tokens(proposal.get("Periodo", ""))
     for _, r in signals_df.iterrows():
-        score = 0
-        if r["instrument"] == proposal["Asset"]:
+        if str(r["instrument"]).upper() != str(proposal["Asset"]).upper():
+            continue
+        score = 8
+        r_tokens = _period_tokens(str(r["period"]))
+        overlap = len(p_tokens & r_tokens)
+        score += overlap * 2
+        if proposal.get("Periodo") and str(r["period"]) == proposal["Periodo"]:
             score += 4
-        if r["bias"] == proposal["Bias"] and proposal["Bias"] != "NEUTRAL":
-            score += 2
-        p1 = normalize_text(str(r["period"]))
-        p2 = normalize_text(proposal["Periodo"])
-        if p1 and p2 and (p1 in p2 or p2 in p1):
-            score += 3
+        pb = proposal.get("Bias", "NEUTRAL")
+        rb = str(r["bias"])
+        if pb != "NEUTRAL":
+            score += 4 if pb == rb else -5
+        # Prefer active setups for new ENTRY/WATCH/SETUP; prefer closed for RESULT.
+        cat = proposal.get("Categoria", "")
+        if cat == "RESULT":
+            score += 3 if r["status"] == "CLOSED" else 0
         else:
-            # softer month/week overlap
-            toks1 = set(re.findall(r"w[1-5]|20\d{2}|" + "|".join(MONTHS), p1))
-            toks2 = set(re.findall(r"w[1-5]|20\d{2}|" + "|".join(MONTHS), p2))
-            score += len(toks1 & toks2)
+            score += 3 if r["status"] in ["WATCH", "READY", "TRIGGERED"] else -1
+        try:
+            last_dt = pd.to_datetime(r["last_update"], errors="coerce")
+            recv_dt = pd.to_datetime(proposal["Ricevuto"], errors="coerce")
+            if pd.notna(last_dt) and pd.notna(recv_dt) and abs((recv_dt - last_dt).total_seconds()) <= 14 * 24 * 3600:
+                score += 1
+        except Exception:
+            pass
         if score > best_score:
             best_score = score
             best_label = destination_label(r)
-    return best_label if best_score >= 6 else "NUOVO"
+    return best_label if best_score >= 10 else "NUOVO"
 
 
 def analyze_item(item: dict, signals_df: pd.DataFrame) -> dict:
     dt = parse_received_at(item["name"])
-    text = ocr_image(item["bytes"])
-    instrument, market_name = detect_instrument(text)
-    bias = detect_bias(text)
-    period = detect_period(text, dt)
-    tf = detect_timeframe(text)
-    category = detect_category(text, instrument)
+    ocr = ocr_image_regions(item["bytes"])
+    instrument, market_name, asset_conf = detect_instrument(ocr["header"], ocr["full"])
+    bias, bias_conf = detect_bias(ocr["header"], ocr["full"])
+    period = detect_period(ocr["combined"], dt)
+    tf = detect_timeframe(ocr["combined"])
+    category = detect_category(ocr["combined"], instrument)
     status = propose_status(category)
     action = propose_next_action(category, bias)
-    conf = confidence_score(instrument, bias, period, tf, category, text)
+    conf = confidence_score(instrument, asset_conf, bias, bias_conf, period, tf, category, ocr["combined"])
+    warning = ""
+    if category != "INFO" and not instrument:
+        warning = "⚠ VERIFICA ASSET"
+    elif category in ["ENTRY", "SETUP", "WATCH"] and bias == "NEUTRAL":
+        warning = "⚠ BIAS DA CONFERMARE"
     proposal = {
-        "Importa": not hash_exists(item["hash"]),
+        "Importa": (not hash_exists(item["hash"])) and (category == "INFO" or bool(instrument)),
         "Ricevuto": dt.strftime("%Y-%m-%d %H:%M:%S"),
         "File": item["name"],
         "Asset": instrument,
@@ -514,19 +612,139 @@ def analyze_item(item: dict, signals_df: pd.DataFrame) -> dict:
         "Stato": status,
         "Gruppo": group_key(instrument, bias, period, category, dt),
         "Destinazione": "NUOVO",
-        "Entry": "",
-        "Stop": "",
-        "Target": "",
+        "Verifica": warning,
+        "Entry": "", "Stop": "", "Target": "",
         "Prossima azione": action,
-        "Sintesi": make_summary(instrument, category, bias, period, text),
+        "Sintesi": make_summary(instrument, category, bias, period, ocr["combined"]),
         "Confidence": conf,
-        "OCR": text,
+        "OCR": ocr["combined"],
+        "OCR_Header": ocr["header"],
         "Hash": item["hash"],
     }
     proposal["Destinazione"] = recommend_destination(proposal, signals_df)
+    if proposal["Destinazione"] not in ["NUOVO", "INFO"]:
+        # Existing validated setup can safely provide missing context, but never overwrite a
+        # directional OCR decision that conflicts with it.
+        m = signals_df[signals_df.apply(lambda r: destination_label(r) == proposal["Destinazione"], axis=1)]
+        if not m.empty:
+            r = m.iloc[0]
+            if proposal["Bias"] == "NEUTRAL":
+                proposal["Bias"] = str(r["bias"])
+                proposal["Verifica"] = "" if proposal["Asset"] else proposal["Verifica"]
+            if not proposal["Periodo"]:
+                proposal["Periodo"] = str(r["period"])
+            if not proposal["TF"]:
+                proposal["TF"] = str(r["timeframe"])
+            proposal["Gruppo"] = f"EXISTING|{int(r['id'])}"
+            proposal["Prossima azione"] = str(r["next_action"] or proposal["Prossima azione"])
     if hash_exists(item["hash"]):
+        proposal["Importa"] = False
+        proposal["Verifica"] = "✓ GIÀ PRESENTE"
         proposal["Sintesi"] = "DUPLICATO già presente nel database. " + proposal["Sintesi"]
     return proposal
+
+
+def refine_batch_proposals(proposals: list[dict], signals_df: pd.DataFrame) -> list[dict]:
+    """Use chronology only to fill missing context, never to invent a new directional call."""
+    if not proposals:
+        return proposals
+    props = sorted(proposals, key=lambda x: x["Ricevuto"])
+    dts = [pd.to_datetime(p["Ricevuto"]) for p in props]
+
+    # 1) Asset propagation inside a tight chronological cluster.
+    for i, p in enumerate(props):
+        if p["Categoria"] == "INFO" or p["Asset"]:
+            continue
+        prev = props[i - 1] if i > 0 else None
+        nxt = props[i + 1] if i + 1 < len(props) else None
+        prev_gap = (dts[i] - dts[i - 1]).total_seconds() / 60 if prev is not None else 999
+        next_gap = (dts[i + 1] - dts[i]).total_seconds() / 60 if nxt is not None else 999
+        inferred = ""
+        if prev and nxt and prev["Asset"] and prev["Asset"] == nxt["Asset"] and prev_gap <= 10 and next_gap <= 10:
+            inferred = prev["Asset"]
+        elif prev and prev["Asset"] and prev_gap <= 7 and prev["Categoria"] != "INFO":
+            inferred = prev["Asset"]
+        if inferred:
+            p["Asset"] = inferred
+            same = next((r for r in ASSET_RULES if r["code"] == inferred), None)
+            if same:
+                p["Mercato"] = same["name"]
+            p["Verifica"] = "⚠ ASSET INFERITO DALLA SEQUENZA"
+            p["Confidence"] = min(int(p["Confidence"]), 70)
+
+    # 2) Propagate period/timeframe context within the same asset and <=10 minutes.
+    for i, p in enumerate(props):
+        if p["Categoria"] == "INFO" or not p["Asset"]:
+            continue
+        candidates = []
+        for j, q in enumerate(props):
+            if i == j or q["Asset"] != p["Asset"] or q["Categoria"] == "INFO":
+                continue
+            gap = abs((dts[i] - dts[j]).total_seconds()) / 60
+            if gap <= 10:
+                candidates.append((gap, q))
+        candidates.sort(key=lambda x: x[0])
+        if not p["Periodo"]:
+            p["Periodo"] = next((q["Periodo"] for _, q in candidates if q["Periodo"]), "")
+        if not p["TF"]:
+            p["TF"] = next((q["TF"] for _, q in candidates if q["TF"]), "")
+        if p["Bias"] == "NEUTRAL":
+            directional = [(gap, q) for gap, q in candidates if q["Bias"] in ["LONG", "SHORT"]]
+            if directional:
+                dirs = {q["Bias"] for _, q in directional}
+                if len(dirs) == 1:
+                    p["Bias"] = directional[0][1]["Bias"]
+
+    # 3) Re-run destination matching after contextual refinement.
+    for p in props:
+        p["Destinazione"] = recommend_destination(p, signals_df)
+        if p["Destinazione"] not in ["NUOVO", "INFO"]:
+            match = [r for _, r in signals_df.iterrows() if destination_label(r) == p["Destinazione"]]
+            if match:
+                r = match[0]
+                if p["Bias"] == "NEUTRAL":
+                    p["Bias"] = str(r["bias"])
+                if not p["Periodo"]:
+                    p["Periodo"] = str(r["period"])
+                if not p["TF"]:
+                    p["TF"] = str(r["timeframe"])
+                p["Gruppo"] = f"EXISTING|{int(r['id'])}"
+                if p["Verifica"] == "⚠ BIAS DA CONFERMARE":
+                    p["Verifica"] = ""
+        else:
+            p["Gruppo"] = group_key(p["Asset"], p["Bias"], p["Periodo"], p["Categoria"], pd.to_datetime(p["Ricevuto"]).to_pydatetime())
+        if p["Categoria"] != "INFO" and not p["Asset"]:
+            p["Importa"] = False
+            p["Verifica"] = "⚠ VERIFICA ASSET"
+        elif p["Destinazione"] == "NUOVO" and p["Categoria"] in ["ENTRY", "SETUP", "WATCH"] and p["Bias"] == "NEUTRAL":
+            p["Verifica"] = "⚠ BIAS DA CONFERMARE"
+    return props
+
+
+def setup_preview(editor_df: pd.DataFrame) -> pd.DataFrame:
+    rows = editor_df[editor_df["Importa"] == True].copy()  # noqa: E712
+    if rows.empty:
+        return pd.DataFrame(columns=["Destinazione finale", "Asset", "Bias", "Periodo", "Immagini", "Controllo"])
+    keys = []
+    for _, r in rows.iterrows():
+        dest = str(r["Destinazione"])
+        key = dest if dest not in ["NUOVO", "INFO"] else ("INFO" if dest == "INFO" else f"NUOVO · {r['Gruppo']}")
+        keys.append(key)
+    rows["_final"] = keys
+    out = []
+    for key, g in rows.groupby("_final"):
+        if key == "INFO":
+            continue
+        warnings = sorted({str(x) for x in g["Verifica"].fillna("") if str(x).strip()})
+        out.append({
+            "Destinazione finale": key,
+            "Asset": first_nonempty(g, "Asset"),
+            "Bias": first_nonempty(g, "Bias"),
+            "Periodo": first_nonempty(g, "Periodo"),
+            "Immagini": len(g),
+            "Controllo": " | ".join(warnings) if warnings else "✓ OK",
+        })
+    return pd.DataFrame(out)
 
 
 def merged_timeframes(rows: pd.DataFrame) -> str:
@@ -670,8 +888,8 @@ def import_batch(editor_df: pd.DataFrame, file_map: dict[str, dict], signals_df:
 init_db()
 auto_expire()
 
-st.title("📡 Signal Radar V2")
-st.caption("WhatsApp → import multiplo → proposta automatica → conferma → una riga per setup, tutte le immagini in cronologia.")
+st.title("📡 Signal Radar V2.1")
+st.caption("WhatsApp → OCR vincolato → deduplica → raggruppamento → revisione → una riga per setup.")
 
 signals = load_signals()
 
@@ -685,7 +903,7 @@ with st.sidebar:
     st.divider()
     ocr_ok = pytesseract is not None and shutil.which("tesseract") is not None
     st.caption(f"OCR locale gratuito: {'✅ disponibile' if ocr_ok else '⚠️ non disponibile'}")
-    st.caption("V2 non importa automaticamente prezzi numerici come affidabili: Entry/Stop/Target restano da confermare.")
+    st.caption("V2.1: whitelist asset + deduplica + grouping. Entry/Stop/Target restano sempre da confermare manualmente.")
 
 filtered = signals.copy()
 if selected_status:
@@ -808,7 +1026,7 @@ with tab_detail:
 
 with tab_batch:
     st.subheader("⚡ Import multiplo WhatsApp")
-    st.caption("Carica molte immagini insieme. V2 le ordina dal nome file, usa OCR locale gratuito e propone Asset/Bias/TF/Categoria/Gruppo. Prima dell'importazione puoi correggere tutto.")
+    st.caption("Carica molte immagini insieme. V2.1 usa una whitelist asset, legge soprattutto il titolo, corregge anni OCR improbabili e tenta di collegare gli aggiornamenti allo stesso setup.")
 
     uploaded_files = st.file_uploader(
         "Trascina qui gli screenshot WhatsApp",
@@ -842,6 +1060,7 @@ with tab_batch:
             for i, item in enumerate(items, start=1):
                 proposals.append(analyze_item(item, load_signals()))
                 progress.progress(i / len(items), text=f"Analisi {i}/{len(items)} · {item['name']}")
+            proposals = refine_batch_proposals(proposals, load_signals())
             progress.empty()
             st.session_state["batch_df"] = pd.DataFrame(proposals)
 
@@ -852,7 +1071,7 @@ with tab_batch:
             destination_options = ["NUOVO", "INFO"] + existing_destinations
 
             st.markdown("### 1. Controlla le proposte")
-            st.info("La colonna **Gruppo** decide quali immagini diventano un unico setup quando Destinazione = NUOVO. Se due immagini appartengono allo stesso setup, lascia lo stesso Gruppo. Se sono setup diversi, cambia il Gruppo.")
+            st.info("V2.1 prova prima a collegare l’immagine a un setup esistente. Solo se **Destinazione = NUOVO**, la colonna **Gruppo** decide quali immagini diventano un unico setup. Le righe con ⚠ richiedono controllo.")
 
             edited = st.data_editor(
                 batch_df,
@@ -862,7 +1081,7 @@ with tab_batch:
                 key="batch_editor",
                 column_order=[
                     "Importa", "Ricevuto", "File", "Asset", "Bias", "Periodo", "TF", "Categoria", "Stato",
-                    "Destinazione", "Gruppo", "Prossima azione", "Entry", "Stop", "Target", "Confidence", "Sintesi",
+                    "Destinazione", "Gruppo", "Verifica", "Prossima azione", "Entry", "Stop", "Target", "Confidence", "Sintesi",
                 ],
                 column_config={
                     "Importa": st.column_config.CheckboxColumn("Importa", width="small"),
@@ -876,6 +1095,7 @@ with tab_batch:
                     "Stato": st.column_config.SelectboxColumn("Stato", options=STATUS_ORDER, width="small"),
                     "Destinazione": st.column_config.SelectboxColumn("Destinazione", options=destination_options, width="large"),
                     "Gruppo": st.column_config.TextColumn("Gruppo", width="large"),
+                    "Verifica": st.column_config.TextColumn("Verifica", width="medium"),
                     "Prossima azione": st.column_config.TextColumn("Prossima azione", width="large"),
                     "Entry": st.column_config.TextColumn("Entry", width="medium"),
                     "Stop": st.column_config.TextColumn("Stop", width="medium"),
@@ -887,7 +1107,20 @@ with tab_batch:
             )
             st.session_state["batch_df"] = edited.copy()
 
-            st.markdown("### 2. Anteprima rapida")
+            if st.button("♻️ Ricalcola destinazioni dopo le correzioni", use_container_width=True):
+                recalculated = refine_batch_proposals(edited.to_dict("records"), current_signals)
+                st.session_state["batch_df"] = pd.DataFrame(recalculated)
+                st.rerun()
+
+            st.markdown("### 2. Setup finali proposti")
+            preview_setups = setup_preview(edited)
+            if preview_setups.empty:
+                st.caption("Nessun setup operativo selezionato.")
+            else:
+                st.dataframe(preview_setups, use_container_width=True, hide_index=True)
+                st.caption(f"Risultato previsto: **{len(preview_setups)} setup operativi**. Le immagini INFO restano fuori dagli Active Signals.")
+
+            st.markdown("### 3. Anteprima immagini")
             preview_names = edited[edited["Importa"] == True]["File"].tolist()  # noqa: E712
             if preview_names:
                 preview = st.selectbox("Scegli immagine da controllare", preview_names, key="batch_preview")
@@ -906,7 +1139,7 @@ with tab_batch:
                         with st.expander("Testo OCR"):
                             st.text(str(prow.get("OCR", "")))
 
-            st.markdown("### 3. Importa")
+            st.markdown("### 4. Importa")
             selected_count = int((edited["Importa"] == True).sum())  # noqa: E712
             st.caption(f"Pronte per l'importazione: {selected_count} immagini. I duplicati sono normalmente deselezionati.")
             if st.button(f"✅ IMPORTA TUTTO ({selected_count})", type="primary", use_container_width=True, disabled=selected_count == 0):
@@ -1045,6 +1278,14 @@ with tab_archive:
         st.download_button("💾 Backup database SQLite", DB_PATH.read_bytes(), "signal_radar.db", "application/octet-stream")
         st.warning("Su Streamlit Community Cloud il filesystem può essere temporaneo. Fai periodicamente il backup del database; una V3 potrà usare un database persistente esterno.")
 
+    with st.expander("🧹 Manutenzione V2.1 — ripristino test iniziale"):
+        st.write("Usa questa funzione **solo adesso**, se la V2 ha creato i duplicati/falsi setup visibili nel test. Cancella le righe del database e ricrea il baseline corretto dei 17 screenshot: 6N, DAX, 6J, FESX ed ES.")
+        confirm_reset = st.checkbox("Confermo: voglio eliminare i setup di test attuali e ripristinare il baseline iniziale", key="confirm_seed_reset")
+        if st.button("🔄 RIPRISTINA BASELINE TEST", disabled=not confirm_reset, type="secondary"):
+            reset_to_seed()
+            st.success("Baseline ripristinato. I duplicati del test V2 sono stati rimossi.")
+            st.rerun()
+
     with st.expander("INFO / immagini non assegnate"):
         if all_updates.empty:
             st.caption("Archivio vuoto.")
@@ -1059,4 +1300,4 @@ with tab_archive:
                     st.divider()
 
 st.divider()
-st.caption("Signal Radar V2 · Obiettivo: organizzare e non perdere i segnali. Le proposte OCR sono assistenza, non conferma automatica di un trade.")
+st.caption("Signal Radar V2.1 · OCR conservativo, whitelist asset, deduplica e raggruppamento. Nessun livello numerico viene accettato automaticamente come segnale di trading.")

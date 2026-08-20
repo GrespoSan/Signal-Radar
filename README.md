@@ -1,60 +1,51 @@
-# Signal Radar V2
+# Signal Radar V2.1
 
-V2 aggiunge l'import multiplo degli screenshot WhatsApp e una proposta automatica gratuita tramite OCR locale.
+V2.1 corregge i problemi emersi nel primo test reale della V2: falsi asset OCR, setup duplicati, anni letti male e collegamenti troppo deboli tra immagini dello stesso segnale.
 
-## Funzioni principali
+## Novità V2.1
 
-- caricamento multiplo di PNG/JPG/JPEG/WEBP;
-- ordinamento cronologico dal nome file WhatsApp;
-- OCR locale con Tesseract, senza API a pagamento;
-- proposta di Asset, Bias, Periodo, TF, Categoria, Stato e Prossima azione;
-- proposta di collegamento a un setup esistente;
-- raggruppamento automatico delle immagini che sembrano appartenere allo stesso nuovo setup;
-- tabella modificabile prima dell'importazione;
-- un solo pulsante `IMPORTA TUTTO`;
-- controllo duplicati tramite SHA-256;
-- timeline delle immagini per setup;
-- Entry / Stop / Target volutamente da confermare manualmente;
-- export CSV e backup del database SQLite.
+- **Whitelist asset** in `asset_whitelist.txt`: l'OCR non può più inventare ticker casuali da frammenti di testo.
+- OCR a **due passaggi**: titolo/header per asset e bias, immagine completa per contesto.
+- Bias più conservativo: `Emo Long/Short` non viene usato da solo per decidere LONG/SHORT.
+- Correzione anni OCR improbabili usando l'anno del file WhatsApp come riferimento.
+- Raggruppamento cronologico per completare asset/periodo mancanti in una sequenza ravvicinata.
+- Collegamento più aggressivo a un **setup esistente** quando asset e periodo coincidono.
+- Colonna **Verifica**: le righe incerte vengono evidenziate e, se manca l'asset, non sono importate automaticamente.
+- Pulsante **Ricalcola destinazioni dopo le correzioni**: utile quando correggi manualmente un asset (es. 6J) e vuoi che l'app lo colleghi al setup già esistente.
+- Anteprima **Setup finali proposti** prima dell'importazione.
+- Deduplica corretta anche per gli screenshot iniziali: V2.1 calcola gli hash mancanti delle immagini seed.
+- Manutenzione: **Ripristina baseline test** per eliminare i duplicati creati dal primo test V2 e tornare ai setup iniziali corretti.
 
-## File da caricare nel repository Streamlit
+## Aggiornamento da V2
 
-Mantieni questa struttura:
+Sostituisci nel repository almeno:
 
-```
-app.py
-requirements.txt
-packages.txt
-README.md
-assets/
-data/
-  seed_signals.csv
-  seed_updates.csv
-  uploads/
-```
+- `app.py`
+- `requirements.txt`
+- `packages.txt`
+- `asset_whitelist.txt`
 
-La cartella `assets/` contiene il dataset dimostrativo iniziale usato per i test. Puoi mantenerla o rimuoverla dopo aver verificato la V2.
+Mantieni anche le cartelle `data/` e `assets/` presenti nello ZIP.
 
-## Uso
+Dopo il deploy, se nella dashboard vedi ancora i falsi setup/duplicati creati dalla V2:
 
-1. Apri **⚡ Import multiplo**.
-2. Trascina insieme gli screenshot WhatsApp.
-3. Premi **Analizza e proponi**.
-4. Controlla la tabella proposta.
-5. Se più immagini appartengono allo stesso setup, devono avere lo stesso valore nella colonna **Gruppo**.
-6. In **Destinazione** scegli:
-   - `NUOVO` per creare un nuovo setup;
-   - `INFO` per materiale didattico/non operativo;
-   - un setup esistente per collegare l'immagine alla timeline corretta.
-7. Conferma manualmente Entry / Stop / Target quando sono importanti.
-8. Premi **IMPORTA TUTTO**.
+1. vai in **Archivio**;
+2. apri **Manutenzione V2.1 — ripristino test iniziale**;
+3. spunta la conferma;
+4. premi **RIPRISTINA BASELINE TEST**.
 
-## Nota importante sull'OCR
+Questo reset è pensato per il test iniziale attuale. Non usarlo in futuro dopo aver iniziato ad archiviare segnali reali che vuoi conservare.
 
-L'OCR serve a classificare e organizzare gli screenshot. Non va considerato affidabile al 100% per numeri di prezzo, stop o target. Per questo la V2 non trascrive automaticamente quei livelli come dati operativi confermati.
+## Flusso Import multiplo
 
-## Streamlit Community Cloud
+1. Carica gli screenshot WhatsApp insieme.
+2. Premi **Analizza e proponi**.
+3. Controlla soprattutto le righe con `⚠` nella colonna **Verifica**.
+4. Se correggi Asset/Bias/Periodo, premi **Ricalcola destinazioni dopo le correzioni**.
+5. Controlla la tabella **Setup finali proposti**.
+6. Conferma Entry/Stop/Target manualmente quando servono.
+7. Premi **IMPORTA TUTTO**.
 
-`packages.txt` installa Tesseract. Il primo deploy può essere più lento del normale.
+## Nota importante
 
-Il database SQLite è locale al filesystem dell'app. Su Community Cloud il filesystem può essere temporaneo: usa periodicamente **Backup database SQLite**. Una futura V3 può usare un database persistente esterno.
+Signal Radar organizza segnali ricevuti; non genera segnali di trading e non considera mai affidabili automaticamente i prezzi numerici letti da OCR.

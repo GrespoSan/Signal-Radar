@@ -1,0 +1,15 @@
+# CODE|MARKET NAME|ALIASES separated by ;
+# Add/edit only instruments you actually want Signal Radar to recognize.
+6N|New Zealand Dollar Futures|new zealand dollar;6n1!;6n1;6n!
+6J|Japanese Yen Futures|japanese yen;6j1!;6j1;6j!
+DAX|DAX Futures|dax futures;fdax1!;fdax;dax
+FESX|Euro Stoxx 50 Futures|euro stoxx 50;eurostoxx 50;eurostoxx;burostoxx;burestoxx;fesx1!;fesx
+ES|S&P 500 E-mini Futures|s&p 500;s&p500;e-mini s&p;es1!;es1
+NQ|Nasdaq 100 Futures|nasdaq 100;nasdaq;nq1!;nq1
+RTY|Russell 2000 Futures|russell 2000;russell;rty1!;rty1
+YM|Dow Jones Futures|dow jones;ym1!;ym1
+GC|Gold Futures|gold futures;gold;oro;gc1!;gc1
+CL|WTI Crude Oil Futures|wti crude oil;crude oil futures;wti;cl1!;cl1
+HG|Copper Futures|copper futures;copper;rame;hg1!;hg1
+6E|Euro FX Futures|euro fx;6e1!;6e1
+6B|British Pound Futures|british pound;6b1!;6b1
