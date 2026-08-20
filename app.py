@@ -40,6 +40,7 @@ STATUS_ICON = {
 BIAS_OPTIONS = ["LONG", "SHORT", "NEUTRAL"]
 BIAS_ICON = {"LONG": "▲", "SHORT": "▼", "NEUTRAL": "•"}
 CATEGORIES = ["ANALISI", "MACRO", "WATCH", "SETUP", "ENTRY", "UPDATE", "RESULT", "RULE", "INFO"]
+MONTHS = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"]
 
 st.set_page_config(page_title="Signal Radar V2.1", page_icon="📡", layout="wide")
 
