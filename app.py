@@ -48,17 +48,24 @@ BIAS_ICON = {"LONG": "▲", "SHORT": "▼", "NEUTRAL": "•"}
 CATEGORIES = ["ANALISI", "MACRO", "WATCH", "SETUP", "ENTRY", "UPDATE", "RESULT", "RULE", "INFO"]
 MONTHS = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"]
 
-# Yahoo è solo un aiuto gratuito/ritardato. Non usiamo proxy spot per DAX/FESX:
-# se non abbiamo un future ragionevolmente equivalente, il prezzo resta manuale.
-YAHOO_TICKERS = {
-    "ES": "ES=F", "NQ": "NQ=F", "YM": "YM=F", "RTY": "RTY=F",
-    "CL": "CL=F", "NG": "NG=F", "GC": "GC=F", "SI": "SI=F", "HG": "HG=F",
-    "ZB": "ZB=F", "ZN": "ZN=F", "ZF": "ZF=F", "ZT": "ZT=F",
-    "6E": "6E=F", "6B": "6B=F", "6A": "6A=F", "6C": "6C=F", "6J": "6J=F", "6N": "6N=F", "6S": "6S=F",
-    "ZC": "ZC=F", "ZS": "ZS=F", "ZW": "ZW=F", "HE": "HE=F", "LE": "LE=F",
+# Prezzi online: la V2.3 prova automaticamente a recuperare il future corrispondente.
+# DAX/FESX hanno anche un controllo di coerenza contro l'indice spot: se il ticker
+# Yahoo del future è palesemente obsoleto/sbagliato, viene scartato e si passa al
+# fallback manuale. Nessun proxy spot viene usato come prezzo operativo del future.
+ONLINE_PRICE_CONFIG = {
+    "ES": {"symbol": "ES=F"}, "NQ": {"symbol": "NQ=F"}, "YM": {"symbol": "YM=F"}, "RTY": {"symbol": "RTY=F"},
+    "CL": {"symbol": "CL=F"}, "NG": {"symbol": "NG=F"}, "GC": {"symbol": "GC=F"}, "SI": {"symbol": "SI=F"}, "HG": {"symbol": "HG=F"},
+    "ZB": {"symbol": "ZB=F"}, "ZN": {"symbol": "ZN=F"}, "ZF": {"symbol": "ZF=F"}, "ZT": {"symbol": "ZT=F"},
+    "6E": {"symbol": "6E=F"}, "6B": {"symbol": "6B=F"}, "6A": {"symbol": "6A=F"}, "6C": {"symbol": "6C=F"},
+    "6J": {"symbol": "6J=F"}, "6N": {"symbol": "6N=F"}, "6S": {"symbol": "6S=F"},
+    "ZC": {"symbol": "ZC=F"}, "ZS": {"symbol": "ZS=F"}, "ZW": {"symbol": "ZW=F"}, "HE": {"symbol": "HE=F"}, "LE": {"symbol": "LE=F"},
+    # Ticker Eurex presenti su Yahoo, accettati solo se coerenti con lo spot.
+    "DAX": {"symbol": "FDAX.EX", "anchor": "^GDAXI", "max_diff_pct": 8.0},
+    "FESX": {"symbol": "FESX.EX", "anchor": "^STOXX50E", "max_diff_pct": 8.0},
 }
+YAHOO_TICKERS = {k: v["symbol"] for k, v in ONLINE_PRICE_CONFIG.items()}
 
-st.set_page_config(page_title="Signal Radar V2.2", page_icon="📡", layout="wide")
+st.set_page_config(page_title="Signal Radar V2.3", page_icon="📡", layout="wide")
 
 
 def get_conn():
@@ -942,33 +949,114 @@ def delete_price(instrument: str):
     conn.close()
 
 
-def fetch_yahoo_price(instrument: str) -> tuple[float | None, str, str]:
-    """Return (price, timestamp, message). Yahoo data is intentionally treated as indicative."""
-    code = str(instrument or "").upper()
-    symbol = YAHOO_TICKERS.get(code, "")
-    if not symbol:
-        return None, "", "Nessun ticker Yahoo affidabile configurato per questo asset."
+def _series_last_price(hist: pd.DataFrame) -> tuple[float | None, str]:
+    if hist is None or hist.empty or "Close" not in hist.columns:
+        return None, ""
+    close = hist["Close"].dropna()
+    if close.empty:
+        return None, ""
+    price = float(close.iloc[-1])
+    idx = close.index[-1]
+    try:
+        ts_obj = pd.Timestamp(idx)
+        if getattr(ts_obj, "tzinfo", None) is not None:
+            ts = ts_obj.tz_convert("Europe/Rome").strftime("%Y-%m-%d %H:%M:%S %Z")
+        else:
+            ts = ts_obj.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        ts = datetime.now().isoformat(timespec="seconds")
+    return price, ts
+
+
+def _fetch_one_yahoo_symbol(symbol: str) -> tuple[float | None, str, str]:
     if yf is None:
         return None, "", "Modulo yfinance non disponibile."
     try:
-        hist = yf.Ticker(symbol).history(period="1d", interval="1m", auto_adjust=False, prepost=False)
-        if hist is None or hist.empty or "Close" not in hist.columns:
-            hist = yf.Ticker(symbol).history(period="5d", interval="5m", auto_adjust=False, prepost=False)
-        if hist is None or hist.empty or "Close" not in hist.columns:
-            return None, "", f"Nessun prezzo restituito da Yahoo per {symbol}."
-        close = hist["Close"].dropna()
-        if close.empty:
-            return None, "", f"Nessun close valido per {symbol}."
-        price = float(close.iloc[-1])
-        idx = close.index[-1]
-        try:
-            ts = pd.Timestamp(idx).tz_convert("Europe/Rome").strftime("%Y-%m-%d %H:%M:%S %Z") if getattr(idx, "tzinfo", None) else pd.Timestamp(idx).strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            ts = datetime.now().isoformat(timespec="seconds")
-        return price, ts, f"{symbol} · dati gratuiti Yahoo, possibili ritardi/differenze di contratto"
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period="1d", interval="1m", auto_adjust=False, prepost=True)
+        px, ts = _series_last_price(hist)
+        if px is None:
+            hist = ticker.history(period="5d", interval="5m", auto_adjust=False, prepost=True)
+            px, ts = _series_last_price(hist)
+        if px is None:
+            return None, "", f"Nessun prezzo online per {symbol}."
+        return px, ts, ""
     except Exception as exc:
         return None, "", f"Errore Yahoo {symbol}: {exc}"
 
+
+@st.cache_data(ttl=90, show_spinner=False)
+def fetch_online_price(instrument: str) -> dict:
+    """Prezzo online automatico. Cache 90 s per non martellare la fonte ad ogni rerun."""
+    code = str(instrument or "").strip().upper()
+    cfg = ONLINE_PRICE_CONFIG.get(code)
+    if not cfg:
+        return {"asset": code, "price": None, "time": "", "source_symbol": "", "message": "Nessuna fonte online configurata."}
+    symbol = cfg["symbol"]
+    px, ts, err = _fetch_one_yahoo_symbol(symbol)
+    if px is None:
+        return {"asset": code, "price": None, "time": "", "source_symbol": symbol, "message": err or "Prezzo non trovato."}
+
+    # Per i ticker Eurex di Yahoo controlliamo che il valore non sia palesemente
+    # obsoleto rispetto all'indice spot. Lo spot serve SOLO come controllo, non
+    # viene mai sostituito al future.
+    anchor_symbol = str(cfg.get("anchor", "") or "")
+    if anchor_symbol:
+        anchor_px, _, anchor_err = _fetch_one_yahoo_symbol(anchor_symbol)
+        if anchor_px is not None and anchor_px > 0:
+            diff = abs(px - anchor_px) / abs(anchor_px) * 100.0
+            max_diff = float(cfg.get("max_diff_pct", 8.0))
+            if diff > max_diff:
+                return {
+                    "asset": code, "price": None, "time": "", "source_symbol": symbol,
+                    "message": f"{symbol} scartato: differenza {diff:.1f}% rispetto a {anchor_symbol}; probabile dato obsoleto/non confrontabile."
+                }
+        elif anchor_err:
+            # Se il controllo spot non è disponibile non consideriamo affidabile
+            # un ticker Eurex storicamente problematico: meglio fallback manuale.
+            return {"asset": code, "price": None, "time": "", "source_symbol": symbol, "message": f"Controllo coerenza non disponibile: {anchor_err}"}
+
+    return {
+        "asset": code, "price": float(px), "time": ts or datetime.now().isoformat(timespec="seconds"),
+        "source_symbol": symbol, "message": f"{symbol} · Yahoo Finance automatico (può essere ritardato)"
+    }
+
+
+def refresh_online_prices(instruments: list[str] | tuple[str, ...], force: bool = False) -> dict[str, dict]:
+    """Aggiorna automaticamente i prezzi trovabili online e li salva nel DB.
+    Restituisce anche gli asset non trovati, che saranno gli unici a richiedere input manuale.
+    """
+    codes = sorted({str(x or "").strip().upper() for x in instruments if str(x or "").strip()})
+    if force:
+        try:
+            fetch_online_price.clear()
+        except Exception:
+            pass
+    out: dict[str, dict] = {}
+    for code in codes:
+        res = fetch_online_price(code)
+        out[code] = res
+        if res.get("price") is not None:
+            upsert_price(
+                code, float(res["price"]), str(res.get("time") or datetime.now().isoformat(timespec="seconds")),
+                "Online automatico · Yahoo Finance", True, str(res.get("source_symbol", "")), str(res.get("message", ""))
+            )
+        else:
+            # Non usare un vecchio prezzo online come se fosse ancora corrente.
+            # Un eventuale fallback manuale, invece, viene conservato.
+            conn = get_conn()
+            old = conn.execute("SELECT source FROM prices WHERE instrument=?", (code,)).fetchone()
+            if old and str(old["source"] or "").startswith("Online automatico"):
+                conn.execute("DELETE FROM prices WHERE instrument=?", (code,))
+                conn.commit()
+            conn.close()
+    return out
+
+
+def fetch_yahoo_price(instrument: str) -> tuple[float | None, str, str]:
+    """Compatibilità con eventuali chiamate V2.2: ora usa il motore automatico V2.3."""
+    res = fetch_online_price(str(instrument or "").upper())
+    return res.get("price"), str(res.get("time", "")), str(res.get("message", ""))
 
 def _numeric_candidates(token: str) -> list[float]:
     t = str(token or "").strip().replace(" ", "")
@@ -1126,10 +1214,12 @@ def format_price(v) -> str:
 init_db()
 auto_expire()
 
-st.title("📡 Signal Radar V2.2")
+st.title("📡 Signal Radar V2.3")
 st.caption("WhatsApp → OCR vincolato → deduplica → raggruppamento → revisione → una riga per setup.")
 
 signals = load_signals()
+_active_assets_boot = sorted(set(signals[signals["status"].isin(["WATCH", "READY", "TRIGGERED"])]["instrument"].dropna().astype(str).str.upper().tolist())) if not signals.empty else []
+online_status = refresh_online_prices(_active_assets_boot) if _active_assets_boot else {}
 prices = load_prices()
 price_map = build_price_map(prices)
 
@@ -1143,7 +1233,7 @@ with st.sidebar:
     st.divider()
     ocr_ok = pytesseract is not None and shutil.which("tesseract") is not None
     st.caption(f"OCR locale gratuito: {'✅ disponibile' if ocr_ok else '⚠️ non disponibile'}")
-    st.caption("V2.2: prezzi correnti + controllo validità. Entry/Stop/Target restano da confermare manualmente; Yahoo è solo indicativo.")
+    st.caption("V2.3: prezzo online automatico (cache 90 s). Input manuale solo quando la fonte online non è disponibile/affidabile.")
 
 filtered = signals.copy()
 if selected_status:
@@ -1274,11 +1364,17 @@ with tab_detail:
             action_new = st.text_area("Prossima azione", r["next_action"])
             notes_new = st.text_area("Note", r["notes"])
             validity_new = st.text_input("Validità (YYYY-MM-DD, vuoto = nessuna)", r["validity_end"])
-            st.markdown("**Prezzo attuale (facoltativo)**")
-            existing_p = price_map.get(str(r["instrument"]).upper(), {})
-            pcol1, pcol2 = st.columns([1, 2])
-            current_price_new = pcol1.number_input("Prezzo", min_value=0.0, value=float(existing_p.get("current_price", 0.0) or 0.0), format="%.6f", key=f"detail_price_{r['id']}")
-            current_price_note = pcol2.text_input("Nota prezzo / contratto", str(existing_p.get("note", "") or ""), key=f"detail_price_note_{r['id']}")
+            online_found_here = bool(online_status.get(str(r["instrument"]).upper(), {}).get("price") is not None)
+            if online_found_here:
+                st.caption("💹 Prezzo trovato automaticamente online: nessun inserimento manuale richiesto.")
+                current_price_new = 0.0
+                current_price_note = ""
+            else:
+                st.markdown("**Fallback prezzo manuale (solo perché online non trovato)**")
+                existing_p = price_map.get(str(r["instrument"]).upper(), {})
+                pcol1, pcol2 = st.columns([1, 2])
+                current_price_new = pcol1.number_input("Prezzo", min_value=0.0, value=float(existing_p.get("current_price", 0.0) or 0.0), format="%.6f", key=f"detail_price_{r['id']}")
+                current_price_note = pcol2.text_input("Nota prezzo / contratto", str(existing_p.get("note", "") or ""), key=f"detail_price_note_{r['id']}")
             if st.form_submit_button("Salva modifiche", type="primary"):
                 data = dict(r)
                 data.update({
@@ -1287,77 +1383,70 @@ with tab_detail:
                     "validity_end": validity_new, "last_update": datetime.now().isoformat(timespec="seconds"),
                 })
                 update_signal(int(r["id"]), data)
-                if current_price_new > 0:
-                    upsert_price(r["instrument"], current_price_new, datetime.now().isoformat(timespec="seconds"), "TradingView / broker (manuale)", True, "", current_price_note)
+                if (not online_found_here) and current_price_new > 0:
+                    upsert_price(r["instrument"], current_price_new, datetime.now().isoformat(timespec="seconds"), "Fallback manuale", True, "", current_price_note)
                 st.success("Setup aggiornato.")
                 st.rerun()
 
 with tab_prices:
-    st.subheader("💹 Prezzi correnti")
-    st.caption("Il prezzo serve a capire se un setup è ancora vicino all'entry, è già passato oltre il target o ha violato lo stop. Per decisioni operative usa preferibilmente il prezzo manuale preso dallo stesso future/continuous del segnale.")
+    st.subheader("💹 Prezzi correnti automatici")
+    st.caption("Signal Radar prova automaticamente la fonte online ogni ~90 secondi. Il prezzo manuale compare SOLO per gli asset che non vengono trovati o che falliscono i controlli di coerenza.")
 
     active_assets = sorted(set(signals[signals["status"].isin(["WATCH", "READY", "TRIGGERED"])]["instrument"].dropna().astype(str).str.upper().tolist())) if not signals.empty else []
-    known_assets = sorted(set(active_assets + list(YAHOO_TICKERS.keys()) + (prices["instrument"].astype(str).str.upper().tolist() if not prices.empty else [])))
-
-    with st.form("manual_price_form"):
-        c1, c2, c3 = st.columns([1, 1, 2])
-        asset_price = c1.selectbox("Asset", known_assets if known_assets else ["ES"], index=0)
-        existing = price_map.get(str(asset_price).upper(), {})
-        price_val = c2.number_input("Prezzo attuale", min_value=0.0, value=float(existing.get("current_price", 0.0) or 0.0), format="%.6f")
-        price_note = c3.text_input("Nota / contratto", str(existing.get("note", "") or ""), placeholder="es. TradingView ES1! / contratto settembre")
-        trusted = st.checkbox("Usa questo prezzo per il controllo di validità", value=True, help="Attivalo solo se il prezzo è dello stesso strumento/base del segnale. I prezzi Yahoo vengono salvati come indicativi e non invalidano automaticamente uno stop.")
-        if st.form_submit_button("💾 Salva prezzo manuale", type="primary"):
-            if price_val <= 0:
-                st.warning("Inserisci un prezzo maggiore di zero.")
-            else:
-                upsert_price(asset_price, price_val, datetime.now().isoformat(timespec="seconds"), "TradingView / broker (manuale)", trusted, "", price_note)
-                st.success(f"Prezzo {asset_price} aggiornato.")
-                st.rerun()
-
-    st.markdown("### Aggiornamento gratuito indicativo")
-    st.caption("Yahoo può essere utile per un colpo d'occhio su alcuni futures CME/CBOT/NYMEX, ma può essere ritardato o riferirsi a un contratto diverso. Per questo NON viene considerato affidabile per invalidare automaticamente un setup.")
-    yahoo_assets = [a for a in active_assets if a in YAHOO_TICKERS]
-    if yahoo_assets:
-        selected_yahoo = st.multiselect("Asset da aggiornare via Yahoo", yahoo_assets, default=yahoo_assets)
-        if st.button("🌐 Aggiorna prezzi Yahoo", use_container_width=True, disabled=not selected_yahoo):
-            prog = st.progress(0, text="Aggiornamento prezzi...")
-            ok, errs = 0, []
-            for i, asset in enumerate(selected_yahoo, 1):
-                px, ts, msg = fetch_yahoo_price(asset)
-                if px is not None:
-                    upsert_price(asset, px, ts or datetime.now().isoformat(timespec="seconds"), "Yahoo Finance (indicativo)", False, YAHOO_TICKERS.get(asset, ""), msg)
-                    ok += 1
-                else:
-                    errs.append(f"{asset}: {msg}")
-                prog.progress(i / len(selected_yahoo), text=f"{asset} · {i}/{len(selected_yahoo)}")
-            prog.empty()
-            if ok:
-                st.success(f"Aggiornati {ok} prezzi indicativi.")
-            for e in errs:
-                st.warning(e)
+    if active_assets:
+        if st.button("🔄 Aggiorna ora i prezzi online", use_container_width=True):
+            online_status = refresh_online_prices(active_assets, force=True)
+            st.success("Tentativo di aggiornamento online completato.")
             st.rerun()
-    else:
-        st.info("Nessun setup attivo con ticker Yahoo configurato. DAX e FESX, per esempio, restano volutamente manuali per evitare proxy non confrontabili con i livelli futures.")
 
-    st.markdown("### Prezzi salvati")
-    prices_now = load_prices()
-    if prices_now.empty:
-        st.info("Nessun prezzo salvato.")
+        # Ricalcolo dalla cache/DB corrente per mostrare lo stato effettivo.
+        current_online = refresh_online_prices(active_assets)
+        prices_now = load_prices()
+        pmap_now = build_price_map(prices_now)
+        status_rows = []
+        missing_assets = []
+        for asset in active_assets:
+            res = current_online.get(asset, {})
+            online_ok = res.get("price") is not None
+            pinfo = pmap_now.get(asset, {})
+            if not online_ok:
+                missing_assets.append(asset)
+            status_rows.append({
+                "Asset": asset,
+                "Prezzo": format_price(pinfo.get("current_price")) if pinfo else "—",
+                "Stato fonte": "✅ ONLINE" if online_ok else "⚠ FALLBACK MANUALE",
+                "Ticker/Fonte": res.get("source_symbol", "") or pinfo.get("source_symbol", "") or "—",
+                "Ora prezzo": pinfo.get("price_time", "—") if pinfo else "—",
+                "Nota": res.get("message", "") if not online_ok else res.get("message", ""),
+            })
+        st.table(pd.DataFrame(status_rows))
+
+        if missing_assets:
+            st.markdown("### ✍️ Solo prezzi non trovati online")
+            st.warning("Inserisci manualmente soltanto questi asset. Quando una fonte online valida tornerà disponibile, il prezzo automatico sostituirà il fallback manuale.")
+            with st.form("manual_price_fallback_form"):
+                c1, c2, c3 = st.columns([1, 1, 2])
+                asset_price = c1.selectbox("Asset non trovato", missing_assets)
+                existing = pmap_now.get(str(asset_price).upper(), {})
+                price_val = c2.number_input("Prezzo attuale", min_value=0.0, value=float(existing.get("current_price", 0.0) or 0.0), format="%.6f")
+                price_note = c3.text_input("Nota / contratto", str(existing.get("note", "") or ""), placeholder="es. TradingView FDAX1! / contratto settembre")
+                if st.form_submit_button("💾 Salva fallback manuale", type="primary"):
+                    if price_val <= 0:
+                        st.warning("Inserisci un prezzo maggiore di zero.")
+                    else:
+                        upsert_price(asset_price, price_val, datetime.now().isoformat(timespec="seconds"), "Fallback manuale", True, "", price_note)
+                        st.success(f"Fallback {asset_price} aggiornato.")
+                        st.rerun()
+        else:
+            st.success("✅ Tutti gli asset attivi hanno un prezzo online disponibile: non serve inserire nulla a mano.")
     else:
-        pview = prices_now.copy()
-        pview["Prezzo"] = pview["current_price"].map(format_price)
-        pview["Affidabilità"] = pview["trusted"].map(lambda x: "✅ usa per validità" if int(x) else "⚠ indicativo")
-        pview = pview[["instrument", "Prezzo", "price_time", "source", "Affidabilità", "note"]]
-        pview.columns = ["Asset", "Prezzo", "Data/ora", "Fonte", "Uso", "Nota / contratto"]
-        st.dataframe(pview, use_container_width=True, hide_index=True)
-        del_asset = st.selectbox("Rimuovi un prezzo salvato", ["—"] + prices_now["instrument"].astype(str).tolist())
-        if del_asset != "—" and st.button("🗑 Rimuovi prezzo"):
-            delete_price(del_asset)
-            st.rerun()
+        st.info("Nessun setup attivo: i prezzi verranno cercati automaticamente quando compariranno asset WATCH/READY/TRIGGERED.")
+
+    st.caption("Nota: il controllo di validità confronta il prezzo con Entry/Stop/Target confermati. Un prezzo online può essere ritardato; per DAX/FESX un dato Yahoo anomalo viene scartato invece di usare lo spot come sostituto del future.")
 
 with tab_batch:
     st.subheader("⚡ Import multiplo WhatsApp")
-    st.caption("Carica molte immagini insieme. V2.2 usa una whitelist asset, legge soprattutto il titolo, corregge anni OCR improbabili e tenta di collegare gli aggiornamenti allo stesso setup.")
+    st.caption("Carica molte immagini insieme. V2.3 usa una whitelist asset, legge soprattutto il titolo, corregge anni OCR improbabili e tenta di collegare gli aggiornamenti allo stesso setup.")
 
     uploaded_files = st.file_uploader(
         "Trascina qui gli screenshot WhatsApp",
@@ -1446,6 +1535,8 @@ with tab_batch:
             st.markdown("### 2. Setup finali proposti")
             preview_setups = setup_preview(edited)
             if not preview_setups.empty:
+                preview_assets = sorted(set(preview_setups["Asset"].dropna().astype(str).str.upper().tolist()))
+                refresh_online_prices(preview_assets)
                 pmap_now = build_price_map(load_prices())
                 preview_setups["Prezzo attuale"] = preview_setups["Asset"].map(lambda a: format_price(pmap_now.get(str(a).upper(), {}).get("current_price")))
                 def _preview_check(pr):
@@ -1457,7 +1548,7 @@ with tab_batch:
             if preview_setups.empty:
                 st.caption("Nessun setup operativo selezionato.")
             else:
-                st.dataframe(preview_setups, use_container_width=True, hide_index=True)
+                st.table(preview_setups)
                 st.caption(f"Risultato previsto: **{len(preview_setups)} setup operativi**. Le immagini INFO restano fuori dagli Active Signals.")
 
             st.markdown("### 3. Anteprima immagini")
@@ -1640,4 +1731,4 @@ with tab_archive:
                     st.divider()
 
 st.divider()
-st.caption("Signal Radar V2.2 · OCR conservativo, whitelist asset, deduplica e raggruppamento. Nessun livello numerico viene accettato automaticamente come segnale di trading.")
+st.caption("Signal Radar V2.3 · OCR conservativo, whitelist asset, deduplica e raggruppamento. Nessun livello numerico viene accettato automaticamente come segnale di trading.")

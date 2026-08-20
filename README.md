@@ -1,8 +1,8 @@
-# Signal Radar V2.2
+# Signal Radar V2.3
 
-V2.2 aggiunge il **prezzo corrente per asset** e un controllo di validità del setup rispetto a Entry/Zona, Stop e Target.
+V2.3 aggiunge il **prezzo corrente per asset** e un controllo di validità del setup rispetto a Entry/Zona, Stop e Target.
 
-## Novità V2.2
+## Novità V2.3
 
 - Nuovo tab **💹 Prezzi**.
 - Prezzo manuale persistente per ogni asset (consigliato: stesso future/continuous usato nel segnale, ad es. TradingView `ES1!`).
@@ -61,3 +61,12 @@ Mantieni le cartelle `data/` e `assets/`. Il database viene migrato automaticame
 5. Aggiorna i prezzi quando vuoi fare una nuova revisione dei segnali.
 
 Signal Radar organizza e controlla segnali ricevuti; non genera segnali di trading.
+
+
+## Novità V2.3
+- Prezzo corrente cercato **automaticamente online** per tutti gli asset attivi e per i setup proposti in import.
+- Cache 90 secondi per evitare chiamate eccessive.
+- Input manuale mostrato **solo** quando il prezzo online non viene trovato o non supera i controlli di coerenza.
+- DAX (`FDAX.EX`) e FESX (`FESX.EX`) vengono accettati solo se coerenti con i rispettivi indici spot; lo spot non viene mai usato come sostituto del future.
+- La tabella “Setup finali proposti” usa una visualizzazione statica per evitare l'errore frontend `data-grid-overlay-editor` osservato su Streamlit Cloud.
+- Un prezzo online trovato viene usato per il check Entry/Stop/Target, ma **non cambia da solo lo stato del setup**: la revisione operativa resta esplicita.
