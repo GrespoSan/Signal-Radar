@@ -1,37 +1,60 @@
-# Signal Radar V1
+# Signal Radar V2
 
-Obiettivo: trasformare screenshot e messaggi WhatsApp di trading in un registro operativo ordinato, con **una riga per setup** e una timeline di tutti gli aggiornamenti.
+V2 aggiunge l'import multiplo degli screenshot WhatsApp e una proposta automatica gratuita tramite OCR locale.
 
-## Cosa fa la V1
+## Funzioni principali
 
-- Dashboard **Active Signals** con WATCH / READY / TRIGGERED.
-- Raggruppamento per setup: 6N, DAX, 6J, FESX, ES.
-- Colonna **PROSSIMA AZIONE**.
-- Validità/scadenza automatica dei setup WATCH/READY.
-- Timeline cronologica di immagini e messaggi per ogni setup.
-- Upload di nuovi screenshot con tre scelte:
-  1. aggiornamento di setup esistente;
-  2. nuovo setup;
-  3. solo INFO/didattica.
-- Modifica di stato, entry, stop, target e prossima azione.
-- Export CSV.
-- Dataset demo già caricato usando i 17 screenshot WhatsApp forniti.
+- caricamento multiplo di PNG/JPG/JPEG/WEBP;
+- ordinamento cronologico dal nome file WhatsApp;
+- OCR locale con Tesseract, senza API a pagamento;
+- proposta di Asset, Bias, Periodo, TF, Categoria, Stato e Prossima azione;
+- proposta di collegamento a un setup esistente;
+- raggruppamento automatico delle immagini che sembrano appartenere allo stesso nuovo setup;
+- tabella modificabile prima dell'importazione;
+- un solo pulsante `IMPORTA TUTTO`;
+- controllo duplicati tramite SHA-256;
+- timeline delle immagini per setup;
+- Entry / Stop / Target volutamente da confermare manualmente;
+- export CSV e backup del database SQLite.
 
-## Avvio locale
+## File da caricare nel repository Streamlit
 
-```bash
-pip install -r requirements.txt
-streamlit run app.py
+Mantieni questa struttura:
+
 ```
+app.py
+requirements.txt
+packages.txt
+README.md
+assets/
+data/
+  seed_signals.csv
+  seed_updates.csv
+  uploads/
+```
+
+La cartella `assets/` contiene il dataset dimostrativo iniziale usato per i test. Puoi mantenerla o rimuoverla dopo aver verificato la V2.
+
+## Uso
+
+1. Apri **⚡ Import multiplo**.
+2. Trascina insieme gli screenshot WhatsApp.
+3. Premi **Analizza e proponi**.
+4. Controlla la tabella proposta.
+5. Se più immagini appartengono allo stesso setup, devono avere lo stesso valore nella colonna **Gruppo**.
+6. In **Destinazione** scegli:
+   - `NUOVO` per creare un nuovo setup;
+   - `INFO` per materiale didattico/non operativo;
+   - un setup esistente per collegare l'immagine alla timeline corretta.
+7. Conferma manualmente Entry / Stop / Target quando sono importanti.
+8. Premi **IMPORTA TUTTO**.
+
+## Nota importante sull'OCR
+
+L'OCR serve a classificare e organizzare gli screenshot. Non va considerato affidabile al 100% per numeri di prezzo, stop o target. Per questo la V2 non trascrive automaticamente quei livelli come dati operativi confermati.
 
 ## Streamlit Community Cloud
 
-Carica l'intera cartella in un repository GitHub e seleziona `app.py` come file principale.
+`packages.txt` installa Tesseract. Il primo deploy può essere più lento del normale.
 
-**Nota importante:** il filesystem di Streamlit Community Cloud non è pensato come archivio permanente. La V1 va benissimo per provare il flusso; per l'uso reale conviene collegare in V2 un database persistente gratuito (es. Supabase) o altro storage.
-
-## Perché la V1 non legge ancora automaticamente i prezzi dalle immagini
-
-Per un'app di trading è meglio non salvare automaticamente livelli numerici letti male da uno screenshot. La V1 imposta il flusso corretto: classificazione, raggruppamento, stato e cronologia; i livelli numerici vengono confermati manualmente.
-
-La V2 può aggiungere un estrattore AI che **propone** asset, bias, entry, stop, target e collegamento al setup esistente, lasciando sempre una conferma umana prima del salvataggio.
+Il database SQLite è locale al filesystem dell'app. Su Community Cloud il filesystem può essere temporaneo: usa periodicamente **Backup database SQLite**. Una futura V3 può usare un database persistente esterno.
