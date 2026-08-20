@@ -3,3 +3,6 @@ pandas>=2.2
 Pillow>=10.4
 pytesseract>=0.3.13
 yfinance>=0.2.54
+
+numpy>=1.26
+opencv-python-headless>=4.10

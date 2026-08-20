@@ -1,45 +1,49 @@
-# Signal Radar V2.3
+# Signal Radar V2.4
 
-V2.3 aggiunge il **prezzo corrente per asset** e un controllo di validità del setup rispetto a Entry/Zona, Stop e Target.
+V2.4 aggiunge l'estrazione automatica **Entry / Zona, Stop e Target** dagli screenshot TradingView/WhatsApp, mantenendo il prezzo corrente online automatico della V2.3.
 
-## Novità V2.3
+## Obiettivo
 
-- Nuovo tab **💹 Prezzi**.
-- Prezzo manuale persistente per ogni asset (consigliato: stesso future/continuous usato nel segnale, ad es. TradingView `ES1!`).
-- Pulsante opzionale **Aggiorna prezzi Yahoo** per alcuni futures supportati.
-- I prezzi Yahoo sono sempre marcati **indicativi** e non vengono usati per invalidare automaticamente uno stop.
-- Dashboard Active Signals con nuove colonne:
-  - Prezzo attuale
-  - Distanza dalla zona Entry
-  - Validità prezzo
-- Nel dettaglio setup compare una scheda che confronta prezzo corrente, Entry, Stop e Target.
-- Il prezzo può essere aggiornato anche direttamente dal dettaglio del setup.
-- La preview dell'import multiplo mostra il prezzo corrente e un check preliminare, se già disponibile.
+Trasformare una sequenza di screenshot in pochi setup leggibili e capire subito:
 
-## Stati del controllo prezzo
+- qual è l'asset e il bias;
+- qual è la zona operativa;
+- dove si trova il prezzo attuale;
+- quanto manca all'Entry;
+- se il setup è ancora da attendere, in zona, già passato o da ricontrollare.
 
-Il controllo è volutamente conservativo:
+## Come vengono ricavati i livelli
 
-- `⚪ PREZZO N/D` → prezzo non inserito.
-- `⚠ LIVELLI N/D` → prezzo presente, ma Entry/Zona non è numerica o manca.
-- `🟢 IN ZONA ENTRY` → prezzo dentro la zona indicata.
-- `🟡 ATTESA PULLBACK` → setup LONG con prezzo ancora sopra la zona.
-- `🟡 ATTESA RIMBALZO` → setup SHORT con prezzo ancora sotto la zona.
-- `🟠 SOTTO ENTRY / SOPRA ENTRY` → il prezzo ha oltrepassato la zona nella direzione sfavorevole; richiede revisione.
-- `⚪ TARGET SUPERATO` → il prezzo ha già oltrepassato il target; non va considerato una nuova entry senza revisione.
-- `🔴 INVALIDATO` → solo con **prezzo affidabile** e Stop numerico violato.
+V2.4 non usa il solo OCR del numero. Combina:
 
-Il prefisso `≈` indica che il prezzo è solo indicativo (ad esempio Yahoo).
+1. parole operative (`Entry`, `Entry Short`, `Entry Long`, `Zona/Area da attenzionare`, `Stop`, `Target`, `T1 Tecnico`);
+2. posizione verticale della scritta nel grafico;
+3. OCR mirato della colonna prezzi a destra;
+4. stima della relazione **pixel verticale → prezzo**;
+5. riconoscimento di bande gialle/verdi vicine alla zona operativa;
+6. prezzo online e range plausibile dell'asset per eliminare letture assurde.
+7. un secondo passaggio **OpenCV adaptive** per recuperare, quando possibile, le cifre bianche nei box verdi/rossi di TradingView.
 
-## Perché il prezzo manuale resta la fonte principale
+## Confidence livelli
 
-I segnali delle immagini sono spesso costruiti su futures continuous (`ES1!`, `6N1!`, DAX/Eurex, ecc.). Un prezzo gratuito esterno può essere ritardato oppure riferito a un contratto diverso. Per questo:
+- `🟢 AUTO HIGH` → Entry sufficientemente robusta: `Livelli OK` è già selezionato e il livello può essere salvato automaticamente.
+- `🟡 VERIFY ENTRY` → il motore ha una proposta, ma deve essere controllata sul grafico. Correggi se necessario e spunta `Livelli OK`.
+- `🟡 PARZIALE` → è stato ricavato Stop/Target ma non una Entry abbastanza robusta.
+- `⚪ LIVELLI N/D` → nessun livello affidabile: il setup può comunque essere importato senza numeri.
 
-1. il prezzo manuale preso dallo stesso grafico TradingView/broker è considerato affidabile;
-2. Yahoo è un aiuto gratuito per il colpo d'occhio, non una fonte per invalidare automaticamente un trade;
-3. per DAX e FESX non vengono usati automaticamente proxy spot, perché potrebbero non essere confrontabili con i livelli futures.
+**Importante:** se `Livelli OK` non è selezionato, Entry/Stop/Target proposti non vengono scritti nel setup. È una protezione intenzionale contro numeri OCR errati.
 
-## Aggiornamento da V2.1 / V2.1.1
+## Nuovo zoom di controllo
+
+Nell'anteprima dell'import multiplo V2.4 mostra anche uno **zoom automatico dell'area livelli / asse prezzi**, così una proposta MEDIUM può essere verificata rapidamente senza cercare manualmente la zona nello screenshot completo.
+
+## Prezzi online
+
+Il prezzo corrente resta automatico con cache di circa 90 secondi. Il campo manuale compare solo quando la fonte online non è disponibile o non supera i controlli di coerenza.
+
+Per DAX e FESX il sistema non sostituisce il future con l'indice spot: se il dato future gratuito non è affidabile passa al fallback manuale.
+
+## Aggiornamento da V2.3
 
 Sostituisci nel repository:
 
@@ -48,25 +52,21 @@ Sostituisci nel repository:
 - `packages.txt`
 - `asset_whitelist.txt`
 
-Mantieni le cartelle `data/` e `assets/`. Il database viene migrato automaticamente aggiungendo la tabella `prices`.
-
-`requirements.txt` contiene ora anche `yfinance` per l'aggiornamento gratuito opzionale.
+Mantieni `data/` e `assets/` se vuoi conservare il database corrente. La V2.4 aggiunge `opencv-python-headless` alle dipendenze; al primo deploy Streamlit Cloud può quindi impiegare un po’ più del solito.
 
 ## Flusso consigliato
 
-1. Importa e raggruppa gli screenshot.
-2. Conferma manualmente Asset, Bias, Entry/Zona, Stop e Target quando il segnale è operativo.
-3. Vai in **💹 Prezzi** e inserisci i prezzi correnti dei setup attivi.
-4. Torna in **🎯 Active Signals**: ordina le occasioni usando `VALIDITÀ PREZZO` e `Dist. Entry`.
-5. Aggiorna i prezzi quando vuoi fare una nuova revisione dei segnali.
+1. Carica gli screenshot in **⚡ Import multiplo**.
+2. Premi **Analizza e proponi**.
+3. Controlla soprattutto righe con `⚠` e `🟡 VERIFY`.
+4. Se correggi Asset/Bias/Categoria, premi **Ricalcola destinazioni + livelli**.
+5. Per un livello MEDIUM, usa lo zoom, correggi i numeri se necessario e spunta `Livelli OK`.
+6. Controlla i **Setup finali proposti**, con prezzo corrente e validità preliminare.
+7. Premi **IMPORTA TUTTO**.
+8. In **Active Signals** il Radar confronta prezzo corrente con Entry/Stop/Target e mostra la distanza dalla zona.
+
+## Limite importante
+
+Gli screenshot WhatsApp comprimono molto le piccole etichette dei prezzi. Per questo V2.4 è volutamente conservativa: un livello dubbio resta `VERIFY` o `N/D` invece di essere promosso artificialmente a livello operativo.
 
 Signal Radar organizza e controlla segnali ricevuti; non genera segnali di trading.
-
-
-## Novità V2.3
-- Prezzo corrente cercato **automaticamente online** per tutti gli asset attivi e per i setup proposti in import.
-- Cache 90 secondi per evitare chiamate eccessive.
-- Input manuale mostrato **solo** quando il prezzo online non viene trovato o non supera i controlli di coerenza.
-- DAX (`FDAX.EX`) e FESX (`FESX.EX`) vengono accettati solo se coerenti con i rispettivi indici spot; lo spot non viene mai usato come sostituto del future.
-- La tabella “Setup finali proposti” usa una visualizzazione statica per evitare l'errore frontend `data-grid-overlay-editor` osservato su Streamlit Cloud.
-- Un prezzo online trovato viene usato per il check Entry/Stop/Target, ma **non cambia da solo lo stato del setup**: la revisione operativa resta esplicita.
