@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import math
 import re
 import shutil
 import sqlite3
@@ -17,6 +18,11 @@ try:
     import pytesseract
 except Exception:
     pytesseract = None
+
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
@@ -42,7 +48,17 @@ BIAS_ICON = {"LONG": "▲", "SHORT": "▼", "NEUTRAL": "•"}
 CATEGORIES = ["ANALISI", "MACRO", "WATCH", "SETUP", "ENTRY", "UPDATE", "RESULT", "RULE", "INFO"]
 MONTHS = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"]
 
-st.set_page_config(page_title="Signal Radar V2.1", page_icon="📡", layout="wide")
+# Yahoo è solo un aiuto gratuito/ritardato. Non usiamo proxy spot per DAX/FESX:
+# se non abbiamo un future ragionevolmente equivalente, il prezzo resta manuale.
+YAHOO_TICKERS = {
+    "ES": "ES=F", "NQ": "NQ=F", "YM": "YM=F", "RTY": "RTY=F",
+    "CL": "CL=F", "NG": "NG=F", "GC": "GC=F", "SI": "SI=F", "HG": "HG=F",
+    "ZB": "ZB=F", "ZN": "ZN=F", "ZF": "ZF=F", "ZT": "ZT=F",
+    "6E": "6E=F", "6B": "6B=F", "6A": "6A=F", "6C": "6C=F", "6J": "6J=F", "6N": "6N=F", "6S": "6S=F",
+    "ZC": "ZC=F", "ZS": "ZS=F", "ZW": "ZW=F", "HE": "HE=F", "LE": "LE=F",
+}
+
+st.set_page_config(page_title="Signal Radar V2.2", page_icon="📡", layout="wide")
 
 
 def get_conn():
@@ -95,6 +111,16 @@ def init_db():
             file_hash TEXT,
             source_filename TEXT,
             FOREIGN KEY(signal_id) REFERENCES signals(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS prices (
+            instrument TEXT PRIMARY KEY,
+            current_price REAL NOT NULL,
+            price_time TEXT NOT NULL,
+            source TEXT NOT NULL,
+            trusted INTEGER DEFAULT 1,
+            source_symbol TEXT,
+            note TEXT
         );
         """
     )
@@ -885,14 +911,227 @@ def import_batch(editor_df: pd.DataFrame, file_map: dict[str, dict], signals_df:
 
     return imported, skipped, messages
 
+def load_prices() -> pd.DataFrame:
+    conn = get_conn()
+    df = pd.read_sql_query("SELECT * FROM prices ORDER BY instrument", conn)
+    conn.close()
+    return df
+
+
+def upsert_price(instrument: str, current_price: float, price_time: str, source: str, trusted: bool = True, source_symbol: str = "", note: str = ""):
+    instrument = str(instrument or "").strip().upper()
+    if not instrument or current_price is None or not math.isfinite(float(current_price)):
+        return
+    conn = get_conn()
+    conn.execute(
+        """INSERT INTO prices (instrument,current_price,price_time,source,trusted,source_symbol,note)
+           VALUES (?,?,?,?,?,?,?)
+           ON CONFLICT(instrument) DO UPDATE SET
+             current_price=excluded.current_price, price_time=excluded.price_time, source=excluded.source,
+             trusted=excluded.trusted, source_symbol=excluded.source_symbol, note=excluded.note""",
+        (instrument, float(current_price), price_time, source, 1 if trusted else 0, source_symbol, note),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_price(instrument: str):
+    conn = get_conn()
+    conn.execute("DELETE FROM prices WHERE instrument=?", (str(instrument).upper(),))
+    conn.commit()
+    conn.close()
+
+
+def fetch_yahoo_price(instrument: str) -> tuple[float | None, str, str]:
+    """Return (price, timestamp, message). Yahoo data is intentionally treated as indicative."""
+    code = str(instrument or "").upper()
+    symbol = YAHOO_TICKERS.get(code, "")
+    if not symbol:
+        return None, "", "Nessun ticker Yahoo affidabile configurato per questo asset."
+    if yf is None:
+        return None, "", "Modulo yfinance non disponibile."
+    try:
+        hist = yf.Ticker(symbol).history(period="1d", interval="1m", auto_adjust=False, prepost=False)
+        if hist is None or hist.empty or "Close" not in hist.columns:
+            hist = yf.Ticker(symbol).history(period="5d", interval="5m", auto_adjust=False, prepost=False)
+        if hist is None or hist.empty or "Close" not in hist.columns:
+            return None, "", f"Nessun prezzo restituito da Yahoo per {symbol}."
+        close = hist["Close"].dropna()
+        if close.empty:
+            return None, "", f"Nessun close valido per {symbol}."
+        price = float(close.iloc[-1])
+        idx = close.index[-1]
+        try:
+            ts = pd.Timestamp(idx).tz_convert("Europe/Rome").strftime("%Y-%m-%d %H:%M:%S %Z") if getattr(idx, "tzinfo", None) else pd.Timestamp(idx).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            ts = datetime.now().isoformat(timespec="seconds")
+        return price, ts, f"{symbol} · dati gratuiti Yahoo, possibili ritardi/differenze di contratto"
+    except Exception as exc:
+        return None, "", f"Errore Yahoo {symbol}: {exc}"
+
+
+def _numeric_candidates(token: str) -> list[float]:
+    t = str(token or "").strip().replace(" ", "")
+    if not t:
+        return []
+    sign = -1.0 if t.startswith("-") else 1.0
+    t = t.lstrip("+-")
+    out: list[float] = []
+    def add(x):
+        try:
+            v = sign * float(x)
+            if math.isfinite(v):
+                out.append(v)
+        except Exception:
+            pass
+    if "," in t and "." in t:
+        if t.rfind(",") > t.rfind("."):
+            add(t.replace(".", "").replace(",", "."))
+        else:
+            add(t.replace(",", ""))
+    elif "," in t:
+        parts = t.split(",")
+        if len(parts) == 2:
+            add(parts[0] + "." + parts[1])
+            if len(parts[1]) == 3 and parts[0] not in ("0", "00"):
+                add(parts[0] + parts[1])
+        else:
+            add("".join(parts[:-1]) + "." + parts[-1])
+            add("".join(parts))
+    elif "." in t:
+        parts = t.split(".")
+        add(t)
+        if len(parts) == 2 and len(parts[1]) == 3 and parts[0] not in ("0", "00"):
+            add(parts[0] + parts[1])
+        elif len(parts) > 2:
+            add("".join(parts))
+    else:
+        add(t)
+    seen, unique = set(), []
+    for v in out:
+        key = round(v, 10)
+        if key not in seen:
+            seen.add(key)
+            unique.append(v)
+    return unique
+
+
+def parse_level_values(text: str, current_price: float | None = None) -> list[float]:
+    tokens = re.findall(r"\d[\d.,]*", str(text or ""))
+    vals = []
+    for token in tokens:
+        cands = _numeric_candidates(token)
+        if not cands:
+            continue
+        if current_price and current_price > 0:
+            def dist(v):
+                if v == 0:
+                    return 999.0
+                return abs(math.log(abs(v) / abs(current_price)))
+            chosen = min(cands, key=dist)
+        else:
+            chosen = cands[0]
+        vals.append(float(chosen))
+    return vals
+
+
+def parse_entry_range(text: str, current_price: float | None = None) -> tuple[float | None, float | None]:
+    vals = parse_level_values(text, current_price)
+    if not vals:
+        return None, None
+    if len(vals) == 1:
+        return vals[0], vals[0]
+    return min(vals[0], vals[1]), max(vals[0], vals[1])
+
+
+def parse_single_level(text: str, current_price: float | None = None) -> float | None:
+    vals = parse_level_values(text, current_price)
+    return vals[0] if vals else None
+
+
+def assess_signal(row: dict | pd.Series, price_row: dict | pd.Series | None) -> dict:
+    if price_row is None:
+        return {"label": "⚪ PREZZO N/D", "distance": None, "detail": "Inserisci il prezzo attuale.", "trusted": False}
+    try:
+        cp = float(price_row["current_price"])
+    except Exception:
+        return {"label": "⚪ PREZZO N/D", "distance": None, "detail": "Prezzo attuale non valido.", "trusted": False}
+    trusted = bool(int(price_row.get("trusted", 0))) if hasattr(price_row, "get") else bool(price_row["trusted"])
+    bias = str(row.get("bias", "NEUTRAL") if hasattr(row, "get") else row["bias"]).upper()
+    entry_text = str(row.get("entry_zone", "") if hasattr(row, "get") else row["entry_zone"])
+    stop_text = str(row.get("stop_level", "") if hasattr(row, "get") else row["stop_level"])
+    target_text = str(row.get("target", "") if hasattr(row, "get") else row["target"])
+    low, high = parse_entry_range(entry_text, cp)
+    stop = parse_single_level(stop_text, cp)
+    target = parse_single_level(target_text, cp)
+    prefix = "" if trusted else "≈ "
+
+    if trusted and stop is not None:
+        if bias == "LONG" and cp <= stop:
+            return {"label": "🔴 INVALIDATO", "distance": None, "detail": f"Prezzo {cp:g} ≤ stop {stop:g}.", "trusted": trusted}
+        if bias == "SHORT" and cp >= stop:
+            return {"label": "🔴 INVALIDATO", "distance": None, "detail": f"Prezzo {cp:g} ≥ stop {stop:g}.", "trusted": trusted}
+
+    if target is not None:
+        reached = (bias == "LONG" and cp >= target) or (bias == "SHORT" and cp <= target)
+        if reached:
+            return {"label": prefix + "⚪ TARGET SUPERATO", "distance": None, "detail": "Il movimento indicato è già arrivato oltre il target: non considerarlo una nuova entry senza revisione.", "trusted": trusted}
+
+    if low is None or high is None:
+        return {"label": prefix + "⚠ LIVELLI N/D", "distance": None, "detail": "Prezzo disponibile, ma Entry/Zona non è numerica o manca.", "trusted": trusted}
+
+    if low <= cp <= high:
+        return {"label": prefix + "🟢 IN ZONA ENTRY", "distance": 0.0, "detail": f"Prezzo {cp:g} dentro zona {low:g}–{high:g}.", "trusted": trusted}
+
+    nearest = low if cp < low else high
+    dist_pct = abs(cp - nearest) / abs(cp) * 100 if cp else None
+    if bias == "LONG":
+        if cp > high:
+            label = "🟡 ATTESA PULLBACK"
+            detail = f"Prezzo sopra la zona long ({low:g}–{high:g}); attesa di ritorno verso l'entry."
+        else:
+            label = "🟠 SOTTO ENTRY"
+            detail = f"Prezzo sotto la zona long ({low:g}–{high:g}); setup da ricontrollare prima di entrare."
+    elif bias == "SHORT":
+        if cp < low:
+            label = "🟡 ATTESA RIMBALZO"
+            detail = f"Prezzo sotto la zona short ({low:g}–{high:g}); attesa di risalita verso l'entry."
+        else:
+            label = "🟠 SOPRA ENTRY"
+            detail = f"Prezzo sopra la zona short ({low:g}–{high:g}); setup da ricontrollare prima di entrare."
+    else:
+        label = "⚪ BIAS N/D"
+        detail = "Bias non definito: confronto prezzo/entry solo informativo."
+    return {"label": prefix + label, "distance": dist_pct, "detail": detail, "trusted": trusted}
+
+
+def build_price_map(prices_df: pd.DataFrame) -> dict[str, dict]:
+    if prices_df.empty:
+        return {}
+    return {str(r["instrument"]).upper(): r.to_dict() for _, r in prices_df.iterrows()}
+
+
+def format_price(v) -> str:
+    try:
+        x = float(v)
+        if abs(x) >= 1000:
+            return f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        if abs(x) >= 10:
+            return f"{x:.3f}".rstrip("0").rstrip(".").replace(".", ",")
+        return f"{x:.5f}".rstrip("0").rstrip(".").replace(".", ",")
+    except Exception:
+        return "—"
+
 
 init_db()
 auto_expire()
 
-st.title("📡 Signal Radar V2.1")
+st.title("📡 Signal Radar V2.2")
 st.caption("WhatsApp → OCR vincolato → deduplica → raggruppamento → revisione → una riga per setup.")
 
 signals = load_signals()
+prices = load_prices()
+price_map = build_price_map(prices)
 
 with st.sidebar:
     st.header("Filtri")
@@ -904,7 +1143,7 @@ with st.sidebar:
     st.divider()
     ocr_ok = pytesseract is not None and shutil.which("tesseract") is not None
     st.caption(f"OCR locale gratuito: {'✅ disponibile' if ocr_ok else '⚠️ non disponibile'}")
-    st.caption("V2.1: whitelist asset + deduplica + grouping. Entry/Stop/Target restano sempre da confermare manualmente.")
+    st.caption("V2.2: prezzi correnti + controllo validità. Entry/Stop/Target restano da confermare manualmente; Yahoo è solo indicativo.")
 
 filtered = signals.copy()
 if selected_status:
@@ -929,8 +1168,8 @@ priority_map = {"TRIGGERED": 0, "READY": 1, "WATCH": 2, "CLOSED": 3, "INVALIDATE
 if not filtered.empty:
     filtered = filtered.assign(_priority=filtered["status"].map(priority_map).fillna(99)).sort_values(["_priority", "last_update"], ascending=[True, False])
 
-tab_dash, tab_detail, tab_batch, tab_single, tab_archive = st.tabs([
-    "🎯 Active Signals", "🧭 Dettaglio setup", "⚡ Import multiplo", "➕ Singola immagine", "🗂 Archivio"
+tab_dash, tab_detail, tab_prices, tab_batch, tab_single, tab_archive = st.tabs([
+    "🎯 Active Signals", "🧭 Dettaglio setup", "💹 Prezzi", "⚡ Import multiplo", "➕ Singola immagine", "🗂 Archivio"
 ])
 
 with tab_dash:
@@ -943,8 +1182,11 @@ with tab_dash:
         view["Bias"] = view["bias"].map(lambda x: f"{BIAS_ICON.get(x,'')} {x}")
         view["Ultimo agg."] = pd.to_datetime(view["last_update"], errors="coerce").dt.strftime("%d/%m %H:%M")
         view["Validità"] = view["validity_end"].replace("", "—")
-        view = view[["Stato", "instrument", "Bias", "period", "timeframe", "entry_zone", "target", "next_action", "Validità", "Ultimo agg."]]
-        view.columns = ["Stato", "Asset", "Bias", "Periodo", "TF", "Entry / zona", "Target", "PROSSIMA AZIONE", "Validità", "Ultimo agg."]
+        view["Prezzo attuale"] = view.apply(lambda r: format_price(price_map.get(str(r["instrument"]).upper(), {}).get("current_price")), axis=1)
+        view["Check prezzo"] = view.apply(lambda r: assess_signal(r, price_map.get(str(r["instrument"]).upper()))["label"], axis=1)
+        view["Dist. entry"] = view.apply(lambda r: (lambda d: "—" if d is None else f"{d:.2f}%")(assess_signal(r, price_map.get(str(r["instrument"]).upper()))["distance"]), axis=1)
+        view = view[["Stato", "instrument", "Bias", "period", "timeframe", "Prezzo attuale", "entry_zone", "Dist. entry", "Check prezzo", "target", "next_action", "Validità", "Ultimo agg."]]
+        view.columns = ["Stato", "Asset", "Bias", "Periodo", "TF", "Prezzo attuale", "Entry / zona", "Dist. Entry", "VALIDITÀ PREZZO", "Target", "PROSSIMA AZIONE", "Validità", "Ultimo agg."]
         st.dataframe(view, use_container_width=True, hide_index=True, height=min(560, 72 + 35 * len(view)))
 
         st.markdown("#### Focus operativo")
@@ -955,9 +1197,16 @@ with tab_dash:
                 c1.caption(f"{BIAS_ICON.get(r['bias'],'')} {r['bias']} · {r['period']} · {r['timeframe']}")
                 c2.markdown(f"**{r['status']}**")
                 c2.caption(f"Validità: {r['validity_end'] or '—'}")
+                pinfo = price_map.get(str(r["instrument"]).upper())
+                check = assess_signal(r, pinfo)
                 c3.markdown(f"**Prossima azione:** {r['next_action'] or '—'}")
+                if pinfo:
+                    c3.markdown(f"**Prezzo attuale:** {format_price(pinfo.get('current_price'))} · **{check['label']}**")
+                    c3.caption(f"{check['detail']} · Fonte: {pinfo.get('source','—')} · {pinfo.get('price_time','—')}")
+                else:
+                    c3.markdown("**Prezzo attuale:** — · ⚪ PREZZO N/D")
                 if r["entry_zone"]:
-                    c3.caption(f"Entry/Zona: {r['entry_zone']} · Target: {r['target'] or '—'}")
+                    c3.caption(f"Entry/Zona: {r['entry_zone']} · Stop: {r['stop_level'] or '—'} · Target: {r['target'] or '—'}")
 
 with tab_detail:
     st.subheader("Cronologia di un setup")
@@ -984,6 +1233,17 @@ with tab_detail:
             st.markdown(f"**Stop:** {r['stop_level'] or '—'}  ")
             st.markdown(f"**Target:** {r['target'] or '—'}  ")
             st.markdown(f"**Validità:** {r['validity_end'] or '—'}")
+        pinfo = price_map.get(str(r["instrument"]).upper())
+        price_check = assess_signal(r, pinfo)
+        with st.container(border=True):
+            pc1, pc2, pc3 = st.columns([1, 1.3, 2.7])
+            pc1.metric("Prezzo attuale", format_price(pinfo.get("current_price")) if pinfo else "—")
+            pc2.markdown(f"**{price_check['label']}**")
+            if pinfo:
+                pc2.caption(f"Fonte: {pinfo.get('source','—')} · {pinfo.get('price_time','—')}")
+            pc3.write(price_check["detail"])
+            if price_check["distance"] is not None:
+                pc3.caption(f"Distanza dalla zona entry: {price_check['distance']:.2f}%")
         if r["notes"]:
             st.info(r["notes"])
 
@@ -1014,6 +1274,11 @@ with tab_detail:
             action_new = st.text_area("Prossima azione", r["next_action"])
             notes_new = st.text_area("Note", r["notes"])
             validity_new = st.text_input("Validità (YYYY-MM-DD, vuoto = nessuna)", r["validity_end"])
+            st.markdown("**Prezzo attuale (facoltativo)**")
+            existing_p = price_map.get(str(r["instrument"]).upper(), {})
+            pcol1, pcol2 = st.columns([1, 2])
+            current_price_new = pcol1.number_input("Prezzo", min_value=0.0, value=float(existing_p.get("current_price", 0.0) or 0.0), format="%.6f", key=f"detail_price_{r['id']}")
+            current_price_note = pcol2.text_input("Nota prezzo / contratto", str(existing_p.get("note", "") or ""), key=f"detail_price_note_{r['id']}")
             if st.form_submit_button("Salva modifiche", type="primary"):
                 data = dict(r)
                 data.update({
@@ -1022,12 +1287,77 @@ with tab_detail:
                     "validity_end": validity_new, "last_update": datetime.now().isoformat(timespec="seconds"),
                 })
                 update_signal(int(r["id"]), data)
+                if current_price_new > 0:
+                    upsert_price(r["instrument"], current_price_new, datetime.now().isoformat(timespec="seconds"), "TradingView / broker (manuale)", True, "", current_price_note)
                 st.success("Setup aggiornato.")
                 st.rerun()
 
+with tab_prices:
+    st.subheader("💹 Prezzi correnti")
+    st.caption("Il prezzo serve a capire se un setup è ancora vicino all'entry, è già passato oltre il target o ha violato lo stop. Per decisioni operative usa preferibilmente il prezzo manuale preso dallo stesso future/continuous del segnale.")
+
+    active_assets = sorted(set(signals[signals["status"].isin(["WATCH", "READY", "TRIGGERED"])]["instrument"].dropna().astype(str).str.upper().tolist())) if not signals.empty else []
+    known_assets = sorted(set(active_assets + list(YAHOO_TICKERS.keys()) + (prices["instrument"].astype(str).str.upper().tolist() if not prices.empty else [])))
+
+    with st.form("manual_price_form"):
+        c1, c2, c3 = st.columns([1, 1, 2])
+        asset_price = c1.selectbox("Asset", known_assets if known_assets else ["ES"], index=0)
+        existing = price_map.get(str(asset_price).upper(), {})
+        price_val = c2.number_input("Prezzo attuale", min_value=0.0, value=float(existing.get("current_price", 0.0) or 0.0), format="%.6f")
+        price_note = c3.text_input("Nota / contratto", str(existing.get("note", "") or ""), placeholder="es. TradingView ES1! / contratto settembre")
+        trusted = st.checkbox("Usa questo prezzo per il controllo di validità", value=True, help="Attivalo solo se il prezzo è dello stesso strumento/base del segnale. I prezzi Yahoo vengono salvati come indicativi e non invalidano automaticamente uno stop.")
+        if st.form_submit_button("💾 Salva prezzo manuale", type="primary"):
+            if price_val <= 0:
+                st.warning("Inserisci un prezzo maggiore di zero.")
+            else:
+                upsert_price(asset_price, price_val, datetime.now().isoformat(timespec="seconds"), "TradingView / broker (manuale)", trusted, "", price_note)
+                st.success(f"Prezzo {asset_price} aggiornato.")
+                st.rerun()
+
+    st.markdown("### Aggiornamento gratuito indicativo")
+    st.caption("Yahoo può essere utile per un colpo d'occhio su alcuni futures CME/CBOT/NYMEX, ma può essere ritardato o riferirsi a un contratto diverso. Per questo NON viene considerato affidabile per invalidare automaticamente un setup.")
+    yahoo_assets = [a for a in active_assets if a in YAHOO_TICKERS]
+    if yahoo_assets:
+        selected_yahoo = st.multiselect("Asset da aggiornare via Yahoo", yahoo_assets, default=yahoo_assets)
+        if st.button("🌐 Aggiorna prezzi Yahoo", use_container_width=True, disabled=not selected_yahoo):
+            prog = st.progress(0, text="Aggiornamento prezzi...")
+            ok, errs = 0, []
+            for i, asset in enumerate(selected_yahoo, 1):
+                px, ts, msg = fetch_yahoo_price(asset)
+                if px is not None:
+                    upsert_price(asset, px, ts or datetime.now().isoformat(timespec="seconds"), "Yahoo Finance (indicativo)", False, YAHOO_TICKERS.get(asset, ""), msg)
+                    ok += 1
+                else:
+                    errs.append(f"{asset}: {msg}")
+                prog.progress(i / len(selected_yahoo), text=f"{asset} · {i}/{len(selected_yahoo)}")
+            prog.empty()
+            if ok:
+                st.success(f"Aggiornati {ok} prezzi indicativi.")
+            for e in errs:
+                st.warning(e)
+            st.rerun()
+    else:
+        st.info("Nessun setup attivo con ticker Yahoo configurato. DAX e FESX, per esempio, restano volutamente manuali per evitare proxy non confrontabili con i livelli futures.")
+
+    st.markdown("### Prezzi salvati")
+    prices_now = load_prices()
+    if prices_now.empty:
+        st.info("Nessun prezzo salvato.")
+    else:
+        pview = prices_now.copy()
+        pview["Prezzo"] = pview["current_price"].map(format_price)
+        pview["Affidabilità"] = pview["trusted"].map(lambda x: "✅ usa per validità" if int(x) else "⚠ indicativo")
+        pview = pview[["instrument", "Prezzo", "price_time", "source", "Affidabilità", "note"]]
+        pview.columns = ["Asset", "Prezzo", "Data/ora", "Fonte", "Uso", "Nota / contratto"]
+        st.dataframe(pview, use_container_width=True, hide_index=True)
+        del_asset = st.selectbox("Rimuovi un prezzo salvato", ["—"] + prices_now["instrument"].astype(str).tolist())
+        if del_asset != "—" and st.button("🗑 Rimuovi prezzo"):
+            delete_price(del_asset)
+            st.rerun()
+
 with tab_batch:
     st.subheader("⚡ Import multiplo WhatsApp")
-    st.caption("Carica molte immagini insieme. V2.1 usa una whitelist asset, legge soprattutto il titolo, corregge anni OCR improbabili e tenta di collegare gli aggiornamenti allo stesso setup.")
+    st.caption("Carica molte immagini insieme. V2.2 usa una whitelist asset, legge soprattutto il titolo, corregge anni OCR improbabili e tenta di collegare gli aggiornamenti allo stesso setup.")
 
     uploaded_files = st.file_uploader(
         "Trascina qui gli screenshot WhatsApp",
@@ -1115,6 +1445,15 @@ with tab_batch:
 
             st.markdown("### 2. Setup finali proposti")
             preview_setups = setup_preview(edited)
+            if not preview_setups.empty:
+                pmap_now = build_price_map(load_prices())
+                preview_setups["Prezzo attuale"] = preview_setups["Asset"].map(lambda a: format_price(pmap_now.get(str(a).upper(), {}).get("current_price")))
+                def _preview_check(pr):
+                    rows_g = edited[(edited["Importa"] == True) & (edited["Asset"].astype(str) == str(pr["Asset"]))]  # noqa: E712
+                    rr = rows_g.iloc[0] if not rows_g.empty else {}
+                    pseudo = {"bias": pr.get("Bias", "NEUTRAL"), "entry_zone": rr.get("Entry", "") if hasattr(rr, "get") else "", "stop_level": rr.get("Stop", "") if hasattr(rr, "get") else "", "target": rr.get("Target", "") if hasattr(rr, "get") else ""}
+                    return assess_signal(pseudo, pmap_now.get(str(pr["Asset"]).upper()))["label"]
+                preview_setups["Check prezzo"] = preview_setups.apply(_preview_check, axis=1)
             if preview_setups.empty:
                 st.caption("Nessun setup operativo selezionato.")
             else:
@@ -1301,4 +1640,4 @@ with tab_archive:
                     st.divider()
 
 st.divider()
-st.caption("Signal Radar V2.1 · OCR conservativo, whitelist asset, deduplica e raggruppamento. Nessun livello numerico viene accettato automaticamente come segnale di trading.")
+st.caption("Signal Radar V2.2 · OCR conservativo, whitelist asset, deduplica e raggruppamento. Nessun livello numerico viene accettato automaticamente come segnale di trading.")

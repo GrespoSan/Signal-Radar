@@ -2,3 +2,4 @@ streamlit>=1.42
 pandas>=2.2
 Pillow>=10.4
 pytesseract>=0.3.13
+yfinance>=0.2.54

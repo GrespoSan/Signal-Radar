@@ -1,51 +1,63 @@
-# Signal Radar V2.1
+# Signal Radar V2.2
 
-V2.1 corregge i problemi emersi nel primo test reale della V2: falsi asset OCR, setup duplicati, anni letti male e collegamenti troppo deboli tra immagini dello stesso segnale.
+V2.2 aggiunge il **prezzo corrente per asset** e un controllo di validità del setup rispetto a Entry/Zona, Stop e Target.
 
-## Novità V2.1
+## Novità V2.2
 
-- **Whitelist asset** in `asset_whitelist.txt`: l'OCR non può più inventare ticker casuali da frammenti di testo.
-- OCR a **due passaggi**: titolo/header per asset e bias, immagine completa per contesto.
-- Bias più conservativo: `Emo Long/Short` non viene usato da solo per decidere LONG/SHORT.
-- Correzione anni OCR improbabili usando l'anno del file WhatsApp come riferimento.
-- Raggruppamento cronologico per completare asset/periodo mancanti in una sequenza ravvicinata.
-- Collegamento più aggressivo a un **setup esistente** quando asset e periodo coincidono.
-- Colonna **Verifica**: le righe incerte vengono evidenziate e, se manca l'asset, non sono importate automaticamente.
-- Pulsante **Ricalcola destinazioni dopo le correzioni**: utile quando correggi manualmente un asset (es. 6J) e vuoi che l'app lo colleghi al setup già esistente.
-- Anteprima **Setup finali proposti** prima dell'importazione.
-- Deduplica corretta anche per gli screenshot iniziali: V2.1 calcola gli hash mancanti delle immagini seed.
-- Manutenzione: **Ripristina baseline test** per eliminare i duplicati creati dal primo test V2 e tornare ai setup iniziali corretti.
+- Nuovo tab **💹 Prezzi**.
+- Prezzo manuale persistente per ogni asset (consigliato: stesso future/continuous usato nel segnale, ad es. TradingView `ES1!`).
+- Pulsante opzionale **Aggiorna prezzi Yahoo** per alcuni futures supportati.
+- I prezzi Yahoo sono sempre marcati **indicativi** e non vengono usati per invalidare automaticamente uno stop.
+- Dashboard Active Signals con nuove colonne:
+  - Prezzo attuale
+  - Distanza dalla zona Entry
+  - Validità prezzo
+- Nel dettaglio setup compare una scheda che confronta prezzo corrente, Entry, Stop e Target.
+- Il prezzo può essere aggiornato anche direttamente dal dettaglio del setup.
+- La preview dell'import multiplo mostra il prezzo corrente e un check preliminare, se già disponibile.
 
-## Aggiornamento da V2
+## Stati del controllo prezzo
 
-Sostituisci nel repository almeno:
+Il controllo è volutamente conservativo:
+
+- `⚪ PREZZO N/D` → prezzo non inserito.
+- `⚠ LIVELLI N/D` → prezzo presente, ma Entry/Zona non è numerica o manca.
+- `🟢 IN ZONA ENTRY` → prezzo dentro la zona indicata.
+- `🟡 ATTESA PULLBACK` → setup LONG con prezzo ancora sopra la zona.
+- `🟡 ATTESA RIMBALZO` → setup SHORT con prezzo ancora sotto la zona.
+- `🟠 SOTTO ENTRY / SOPRA ENTRY` → il prezzo ha oltrepassato la zona nella direzione sfavorevole; richiede revisione.
+- `⚪ TARGET SUPERATO` → il prezzo ha già oltrepassato il target; non va considerato una nuova entry senza revisione.
+- `🔴 INVALIDATO` → solo con **prezzo affidabile** e Stop numerico violato.
+
+Il prefisso `≈` indica che il prezzo è solo indicativo (ad esempio Yahoo).
+
+## Perché il prezzo manuale resta la fonte principale
+
+I segnali delle immagini sono spesso costruiti su futures continuous (`ES1!`, `6N1!`, DAX/Eurex, ecc.). Un prezzo gratuito esterno può essere ritardato oppure riferito a un contratto diverso. Per questo:
+
+1. il prezzo manuale preso dallo stesso grafico TradingView/broker è considerato affidabile;
+2. Yahoo è un aiuto gratuito per il colpo d'occhio, non una fonte per invalidare automaticamente un trade;
+3. per DAX e FESX non vengono usati automaticamente proxy spot, perché potrebbero non essere confrontabili con i livelli futures.
+
+## Aggiornamento da V2.1 / V2.1.1
+
+Sostituisci nel repository:
 
 - `app.py`
 - `requirements.txt`
 - `packages.txt`
 - `asset_whitelist.txt`
 
-Mantieni anche le cartelle `data/` e `assets/` presenti nello ZIP.
+Mantieni le cartelle `data/` e `assets/`. Il database viene migrato automaticamente aggiungendo la tabella `prices`.
 
-Dopo il deploy, se nella dashboard vedi ancora i falsi setup/duplicati creati dalla V2:
+`requirements.txt` contiene ora anche `yfinance` per l'aggiornamento gratuito opzionale.
 
-1. vai in **Archivio**;
-2. apri **Manutenzione V2.1 — ripristino test iniziale**;
-3. spunta la conferma;
-4. premi **RIPRISTINA BASELINE TEST**.
+## Flusso consigliato
 
-Questo reset è pensato per il test iniziale attuale. Non usarlo in futuro dopo aver iniziato ad archiviare segnali reali che vuoi conservare.
+1. Importa e raggruppa gli screenshot.
+2. Conferma manualmente Asset, Bias, Entry/Zona, Stop e Target quando il segnale è operativo.
+3. Vai in **💹 Prezzi** e inserisci i prezzi correnti dei setup attivi.
+4. Torna in **🎯 Active Signals**: ordina le occasioni usando `VALIDITÀ PREZZO` e `Dist. Entry`.
+5. Aggiorna i prezzi quando vuoi fare una nuova revisione dei segnali.
 
-## Flusso Import multiplo
-
-1. Carica gli screenshot WhatsApp insieme.
-2. Premi **Analizza e proponi**.
-3. Controlla soprattutto le righe con `⚠` nella colonna **Verifica**.
-4. Se correggi Asset/Bias/Periodo, premi **Ricalcola destinazioni dopo le correzioni**.
-5. Controlla la tabella **Setup finali proposti**.
-6. Conferma Entry/Stop/Target manualmente quando servono.
-7. Premi **IMPORTA TUTTO**.
-
-## Nota importante
-
-Signal Radar organizza segnali ricevuti; non genera segnali di trading e non considera mai affidabili automaticamente i prezzi numerici letti da OCR.
+Signal Radar organizza e controlla segnali ricevuti; non genera segnali di trading.
